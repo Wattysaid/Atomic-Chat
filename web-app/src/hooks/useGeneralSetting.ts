@@ -27,6 +27,9 @@ type GeneralSettingState = {
   huggingfaceToken?: string
   scanLocalModels: boolean
   localScanFolders: string[]
+  // Drives the "New" pill on the Integrations nav item — cleared on first visit.
+  integrationsBadgeSeen: boolean
+  markIntegrationsBadgeSeen: () => void
   setHuggingfaceToken: (token: string) => void
   setSpellCheckChatInput: (value: boolean) => void
   setTokenCounterCompact: (value: boolean) => void
@@ -53,6 +56,11 @@ export const useGeneralSetting = create<GeneralSettingState>()(
       huggingfaceToken: undefined,
       scanLocalModels: true,
       localScanFolders: [],
+      integrationsBadgeSeen: false,
+      markIntegrationsBadgeSeen: () =>
+        set((state) =>
+          state.integrationsBadgeSeen ? state : { integrationsBadgeSeen: true }
+        ),
       setSpellCheckChatInput: (value) => set({ spellCheckChatInput: value }),
       setTokenCounterCompact: (value) => set({ tokenCounterCompact: value }),
       setDisableReasoning: (value) => set({ disableReasoning: value }),
