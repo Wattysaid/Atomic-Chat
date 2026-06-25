@@ -154,6 +154,7 @@ pub fn run() {
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
         core::system::commands::open_agent_terminal,
+        core::system::commands::launch_editor,
         // Server commands
         core::server::commands::start_server,
         core::server::commands::stop_server,
@@ -269,6 +270,7 @@ pub fn run() {
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
         core::system::commands::open_agent_terminal,
+        core::system::commands::launch_editor,
         // Server commands
         core::server::commands::start_server,
         core::server::commands::stop_server,
