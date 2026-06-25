@@ -482,7 +482,9 @@ const DropdownModelProvider = memo(function DropdownModelProvider({
           </button>
           {currentModel?.settings &&
             provider &&
-            provider.provider === 'llamacpp' && (
+            (provider.provider === 'llamacpp' ||
+              provider.provider === 'llamacpp-upstream' ||
+              provider.provider === 'mlx') && (
               <div onClick={(e) => e.stopPropagation()}>
                 <ModelSetting
                   model={currentModel as Model}
