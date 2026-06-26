@@ -115,6 +115,30 @@ function formatCatalogFileSize(bytes?: number): string | undefined {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`
 }
 
+// MTP (Multi-Token Prediction) companion GGUFs are speculative-decoding heads,
+// not standalone models, so we keep them out of the downloadable quant list.
+// Match only dedicated MTP files: an `MTP/` folder, or `mtp` as a leading/trailing
+// filename token. `mtp` mid-name (e.g. Qwen built-in-MTP full models) is left intact.
+export function isMtpCompanionFile(rfilename: string): boolean {
+  const lower = rfilename.toLowerCase()
+  if (/(^|\/)mtp\//.test(lower)) return true
+  const base = (lower.split('/').pop() ?? lower).replace(/\.gguf$/, '')
+  return /^mtp[-_.]/.test(base) || /[-_]mtp$/.test(base)
+}
+
+// Drop MTP companion quants from a catalog entry, keying off the file path
+// (the real HF filename) and falling back to the quant id when absent.
+export function stripMtpCompanionQuants<
+  T extends Pick<CatalogModel, 'quants' | 'num_quants'>,
+>(model: T): T {
+  if (!model.quants?.length) return model
+  const quants = model.quants.filter(
+    (q) => !isMtpCompanionFile(q.path || q.model_id)
+  )
+  if (quants.length === model.quants.length) return model
+  return { ...model, quants, num_quants: quants.length }
+}
+
 export function getPreferredMmprojModel(
   model: Pick<CatalogModel, 'mmproj_models'>
 ): MMProjModel | undefined {
