@@ -24,6 +24,7 @@ import {
 } from '@/stores/model-catalog-store'
 import type { CatalogModel } from '@/services/models/types'
 import { sanitizeModelId } from '@/lib/utils'
+import { stripMtpCompanionQuants } from '@/lib/models'
 
 type ModelSourcesState = {
   sources: CatalogModel[]
@@ -43,9 +44,12 @@ const adaptCatalog = (
     // OS-agnostic so the same cache works for a user who later moves to
     // macOS.
     if (is_mlx && !IS_MACOS) continue
+    // Hide MTP companion GGUFs baked into the curated catalog — they are
+    // speculative-decoding heads, not standalone downloadable models.
+    const stripped = stripMtpCompanionQuants(entry)
     out.push({
-      ...entry,
-      quants: entry.quants?.map((q) => ({
+      ...stripped,
+      quants: stripped.quants?.map((q) => ({
         ...q,
         model_id: sanitizeModelId(q.model_id),
       })),

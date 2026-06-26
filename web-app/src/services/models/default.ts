@@ -3,6 +3,7 @@
  */
 
 import { sanitizeModelId, LOCAL_LLAMACPP_PROVIDER } from '@/lib/utils'
+import { isMtpCompanionFile } from '@/lib/models'
 import {
   AIEngine,
   EngineManager,
@@ -313,9 +314,11 @@ export class DefaultModelsService implements ModelsService {
         file.rfilename.toLowerCase().endsWith('.gguf')
       ) || []
 
-    // Separate regular GGUF files from mmproj files
+    // Separate regular GGUF files from mmproj and MTP companion files
     const regularGgufFiles = ggufFiles.filter(
-      (file) => !file.rfilename.toLowerCase().includes('mmproj')
+      (file) =>
+        !file.rfilename.toLowerCase().includes('mmproj') &&
+        !isMtpCompanionFile(file.rfilename)
     )
 
     const mmprojFiles = ggufFiles.filter((file) =>
