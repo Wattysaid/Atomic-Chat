@@ -46,6 +46,12 @@ type SearchParams = {
   q?: string
 }
 
+// HuggingFace READMEs open with a YAML frontmatter block (license, tags,
+// base_model…). Without a frontmatter parser it renders as stray `---` rules
+// and key/value text, so strip it before display.
+const stripFrontmatter = (markdown: string): string =>
+  markdown.replace(/^\uFEFF?\s*---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')
+
 export const Route = createFileRoute('/hub/$modelId')({
   component: HubModelDetailContent,
   validateSearch: (search: Record<string, unknown>): SearchParams => ({
@@ -328,7 +334,7 @@ function HubModelDetailContent() {
         })
         .then((response) => response.text())
         .then((content) => {
-          setReadmeContent(content)
+          setReadmeContent(stripFrontmatter(content))
           setIsLoadingReadme(false)
         })
         .catch((error) => {
@@ -728,17 +734,18 @@ function HubModelDetailContent() {
                 ) : readmeContent ? (
                   <div className="prose prose-invert max-w-none">
                     <RenderMarkdown
-                      components={{
-                        a: ({ ...props }) => (
-                          <a
-                            {...props}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                          />
-                        ),
-                      }}
-                      content={readmeContent}
-                    />
+                    allowRawHtml
+                    components={{
+                      a: ({ ...props }) => (
+                        <a
+                          {...props}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        />
+                      ),
+                    }}
+                    content={readmeContent}
+                  />
                   </div>
                 ) : (
                   <div className="flex items-center justify-center py-8">

@@ -35,14 +35,8 @@ interface MarkdownProps {
   isStreaming?: boolean
   messageId?: string
   isAnimating?: boolean
-  /**
-   * When enabled, fenced ```html / ```htm blocks render as an interactive
-   * artifact (live sandboxed preview + raw code) instead of a plain code
-   * block. All other languages (including mermaid) keep their default
-   * streamdown rendering. Off by default so non-chat surfaces (hub READMEs,
-   * settings descriptions) are unaffected.
-   */
   enableHtmlPreview?: boolean
+  allowRawHtml?: boolean
 }
 
 const HTML_LANGUAGES = new Set(['html', 'htm'])
@@ -51,6 +45,12 @@ const HTML_LANGUAGES = new Set(['html', 'htm'])
 // renderer used to delegate non-HTML code blocks back to streamdown.
 const REMARK_PLUGINS = [remarkGfm, remarkMath, disableIndentedCodeBlockPlugin]
 const REHYPE_PLUGINS = [rehypeKatex, defaultRehypePlugins.harden]
+const REHYPE_PLUGINS_WITH_RAW_HTML = [
+  defaultRehypePlugins.raw,
+  defaultRehypePlugins.sanitize,
+  defaultRehypePlugins.harden,
+  rehypeKatex,
+]
 const STREAMDOWN_PLUGINS = { code, mermaid, cjk }
 const STREAMDOWN_CONTROLS = { mermaid: { fullscreen: false } }
 
@@ -173,8 +173,13 @@ function RenderMarkdownComponent({
   messageId,
   isAnimating,
   isStreaming,
-  enableHtmlPreview
+  enableHtmlPreview,
+  allowRawHtml,
 }: MarkdownProps) {
+
+  const rehypePlugins = allowRawHtml
+    ? REHYPE_PLUGINS_WITH_RAW_HTML
+    : REHYPE_PLUGINS
 
   const normalizedContent = useMemo(() => {
     const prepared = enableHtmlPreview ? wrapBareHtmlDocument(content) : content
@@ -307,7 +312,7 @@ function RenderMarkdownComponent({
           className
         )}
         remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={REHYPE_PLUGINS}
+        rehypePlugins={rehypePlugins}
         components={mergedComponents}
         plugins={STREAMDOWN_PLUGINS}
         controls={STREAMDOWN_CONTROLS}
@@ -323,6 +328,7 @@ export const RenderMarkdown = memo(
   (prevProps, nextProps) =>
     prevProps.content === nextProps.content &&
     prevProps.enableHtmlPreview === nextProps.enableHtmlPreview &&
+    prevProps.allowRawHtml === nextProps.allowRawHtml &&
     // With HTML preview on, re-render on streaming→done to drop the loader.
     (!nextProps.enableHtmlPreview ||
       prevProps.isStreaming === nextProps.isStreaming)
