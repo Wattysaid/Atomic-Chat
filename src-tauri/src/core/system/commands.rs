@@ -996,12 +996,14 @@ pub fn configure_hermes_agent(
     let config_path = hermes_dir.join("config.yaml");
     let env_path = hermes_dir.join(".env");
 
+    // The installer runs with `-SkipSetup`, so on a fresh install (notably
+    // Windows) no config.yaml exists yet. Seed a default skeleton so the patch
+    // logic below has the anchors it expects, instead of failing outright.
     if !config_path.exists() {
-        return Err(
-            "Hermes Agent is not installed (~/.hermes/config.yaml not found). \
-             Install it first: https://github.com/NousResearch/hermes-agent"
-                .to_string(),
-        );
+        std::fs::create_dir_all(&hermes_dir)
+            .map_err(|e| format!("Failed to create ~/.hermes directory: {}", e))?;
+        std::fs::write(&config_path, HERMES_DEFAULT_CONFIG)
+            .map_err(|e| format!("Failed to create config.yaml: {}", e))?;
     }
 
     let content = std::fs::read_to_string(&config_path)
@@ -1193,6 +1195,22 @@ const ATOMIC_PROVIDER_NAME: &str = "atomic-chat";
 /// Hermes otherwise defaults to 1800s (`HERMES_API_TIMEOUT`); a tighter cap
 /// lets a wedged local turn fail fast without waiting half an hour.
 const HERMES_REQUEST_TIMEOUT_SECONDS: u32 = 180;
+
+/// Minimal Hermes `config.yaml` skeleton seeded when none exists yet.
+///
+/// The installer is spawned with `-SkipSetup`/`--skip-setup`, which skips the
+/// interactive wizard that would otherwise create `~/.hermes/config.yaml`. On
+/// Windows the install script writes no config at all, so `configure_*` had
+/// nothing to patch. This skeleton carries exactly the anchors the patch logic
+/// expects (`default`/`provider`/`base_url` model keys + `custom_providers`);
+/// `configure_hermes_agent` then rewrites them to point at the local server.
+/// Values mirror the Hermes defaults restored by `clear_hermes_agent_config`.
+const HERMES_DEFAULT_CONFIG: &str = "model:
+  default: anthropic/claude-opus-4.6
+  provider: auto
+  base_url: https://openrouter.ai/api/v1
+custom_providers: []
+";
 
 /// Split the config into (before, entries, after) around `custom_providers:`.
 /// `entries` is a Vec of Vec<String>, one per YAML list item.
@@ -1778,6 +1796,52 @@ fn apply_runtime_path(cmd: &mut std::process::Command) {
 
 #[cfg(not(windows))]
 fn apply_runtime_path(_cmd: &mut std::process::Command) {}
+
+/// Decode bytes captured from a spawned process into a String. On Windows,
+/// `cmd.exe` emits its own diagnostics (e.g. "... is not recognized as an
+/// internal or external command") in the console OEM codepage (cp866 on a
+/// Russian install), NOT UTF-8 — decoding those as UTF-8 yields mojibake.
+/// Node-based CLIs like Cline already emit UTF-8, so try UTF-8 first and only
+/// fall back to the OEM codepage when the bytes are not valid UTF-8.
+#[cfg(windows)]
+fn decode_console_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            decode_oem(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
+        }
+    }
+}
+
+/// Decode a byte buffer using the current Windows OEM codepage.
+#[cfg(windows)]
+fn decode_oem(bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let cp = unsafe { GetOEMCP() };
+    let len = bytes.len() as i32;
+    // First pass: required wide-char count.
+    let needed =
+        unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return None;
+    }
+    let mut buf: Vec<u16> = vec![0; needed as usize];
+    let written =
+        unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, buf.as_mut_ptr(), needed) };
+    if written <= 0 {
+        return None;
+    }
+    buf.truncate(written as usize);
+    Some(String::from_utf16_lossy(&buf))
+}
+
+#[cfg(not(windows))]
+fn decode_console_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
 
 /// Proxy details forwarded from the app's in-app proxy config so that spawned
 /// agent installers/terminals can reach the network when the user is behind a
@@ -3269,14 +3333,26 @@ pub fn configure_cline(
     // Find the npm-installed `cline` even when launched from Finder/Dock with a
     // minimal PATH (macOS/Linux); no-op on Windows.
     apply_login_path(&mut cmd);
+    // On Windows, augment with the freshly-read registry PATH so a `cline`
+    // installed by npm earlier in this same session (after the GUI snapshotted
+    // PATH at startup) is found without an app restart -- mirrors `install_agent`.
+    apply_runtime_path(&mut cmd);
 
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to spawn 'cline': {}", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("`cline auth` failed: {}", stderr.trim()));
+        // `cmd.exe`'s own errors arrive in the OEM codepage, not UTF-8, so decode
+        // accordingly. Prefer stderr; fall back to stdout since the stream split
+        // for `cline auth` is undocumented.
+        let stderr = decode_console_bytes(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            decode_console_bytes(&output.stdout).trim().to_string()
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(format!("`cline auth` failed: {}", detail));
     }
 
     log::info!("Cline configured: baseUrl={}, model={}", api_url, model);
