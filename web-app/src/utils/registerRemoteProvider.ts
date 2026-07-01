@@ -74,7 +74,7 @@ export async function registerRemoteProvider(
   const request: RegisterProviderRequest = {
     provider: provider.provider,
     api_key: provider.api_key || undefined,
-    base_url: provider.base_url,
+    base_url: provider.base_url?.trim(),
     custom_headers: (provider.custom_header || []).map((h) => ({
       header: h.header,
       value: h.value,

@@ -526,63 +526,76 @@ function ProviderDetail() {
   // Note: settingsChanged event is now handled globally in GlobalEventHandler
   // This ensures all screens receive the event intermediately
 
-  // Auto-load models for loopback providers (Ollama, LM Studio, …) on entry.
-  // Their catalog is dynamic — whatever the user has pulled locally — so we
-  // silently probe /v1/models when the page opens instead of forcing a manual
-  // Refresh. Runs once per navigation into the provider; errors are non-fatal
-  // and the manual Refresh button remains available.
+  // Auto-load models for loopback providers (Ollama, LM Studio, custom
+  // self-hosted OpenAI-compatible servers, …). Their catalog is dynamic —
+  // whatever the user runs locally — so we silently probe /v1/models instead
+  // of forcing a manual Refresh. This fires both on entry (built-in Ollama,
+  // whose loopback base_url comes from the registry) AND when the user edits a
+  // custom provider's Base URL to a loopback address. Errors are non-fatal and
+  // the manual Refresh button remains available.
+  const loopbackBaseUrl =
+    provider &&
+    !isLocalProvider(provider.provider) &&
+    provider.base_url &&
+    isLoopbackUrl(provider.base_url)
+      ? provider.base_url
+      : null
+
   useEffect(() => {
-    const prov = useModelProvider.getState().getProviderByName(providerName)
-    if (
-      !prov ||
-      isLocalProvider(prov.provider) ||
-      !prov.base_url ||
-      !isLoopbackUrl(prov.base_url)
-    ) {
-      return
-    }
+    if (!loopbackBaseUrl) return
 
     let cancelled = false
-    const load = async () => {
-      setRefreshingModels(true)
-      try {
-        const liveIds = await serviceHub
-          .providers()
-          .fetchModelsFromProvider(prov)
-        if (cancelled) return
 
-        const existing = new Set(prov.models.map((m) => m.id))
-        const newModels = liveIds
-          .filter((id) => !existing.has(id))
-          .map((id) => ({
-            id,
-            model: id,
-            name: id,
-            capabilities: getModelCapabilities(prov.provider, id),
-            version: '1.0',
-          }))
+    // Debounce: editing the Base URL field char-by-char must not spam the
+    // endpoint. We fetch only after typing settles (and re-fetch cleanly if
+    // the URL changes again, since the timer is cleared on cleanup).
+    const timer = setTimeout(() => {
+      const prov = useModelProvider.getState().getProviderByName(providerName)
+      if (cancelled || !prov) return
 
-        if (newModels.length > 0) {
-          updateProvider(prov.provider, {
-            ...prov,
-            models: [...prov.models, ...newModels],
-          })
+      const load = async () => {
+        setRefreshingModels(true)
+        try {
+          const liveIds = await serviceHub
+            .providers()
+            .fetchModelsFromProvider(prov)
+          if (cancelled) return
+
+          const existing = new Set(prov.models.map((m) => m.id))
+          const newModels = liveIds
+            .filter((id) => !existing.has(id))
+            .map((id) => ({
+              id,
+              model: id,
+              name: id,
+              capabilities: getModelCapabilities(prov.provider, id),
+              version: '1.0',
+            }))
+
+          if (newModels.length > 0) {
+            updateProvider(prov.provider, {
+              ...prov,
+              models: [...prov.models, ...newModels],
+            })
+          }
+        } catch (err) {
+          console.warn(
+            `[providers:${providerName}] auto model load failed (non-fatal):`,
+            err
+          )
+        } finally {
+          if (!cancelled) setRefreshingModels(false)
         }
-      } catch (err) {
-        console.warn(
-          `[providers:${providerName}] auto model load failed (non-fatal):`,
-          err
-        )
-      } finally {
-        if (!cancelled) setRefreshingModels(false)
       }
-    }
 
-    void load()
+      void load()
+    }, 500)
+
     return () => {
       cancelled = true
+      clearTimeout(timer)
     }
-  }, [providerName, serviceHub, updateProvider])
+  }, [providerName, loopbackBaseUrl, serviceHub, updateProvider])
 
   const handleRefreshModels = async () => {
     if (!provider) return
@@ -1959,7 +1972,17 @@ function ProviderDetail() {
                                 settingKey === 'base-url' &&
                                 typeof newValue === 'string'
                               ) {
-                                updateObj.base_url = newValue
+                                // Trim so a stray leading/trailing space (common
+                                // on paste) doesn't leak into request URLs as
+                                // `/v1 /models` → 404. Normalise the stored
+                                // setting value too, not just the mirror field.
+                                const trimmedUrl = newValue.trim()
+                                ;(
+                                  newSettings[settingIndex].controller_props as {
+                                    value: string | boolean | number
+                                  }
+                                ).value = trimmedUrl
+                                updateObj.base_url = trimmedUrl
                               }
 
                               // Reset device setting to empty when backend version changes

@@ -12,7 +12,44 @@ import { fetch as fetchTauri } from '@tauri-apps/plugin-http'
 import { invoke } from '@tauri-apps/api/core'
 import { DefaultProvidersService } from './default'
 import { getModelCapabilities } from '@/lib/models'
-import { isLoopbackUrl } from '@/utils/registerRemoteProvider'
+
+/**
+ * Turn a raw `get_local_http` failure (e.g. `HTTP 404: 404 page not found`,
+ * `Request failed: …`) into a concrete, user-readable reason. Mirrors the
+ * status handling on the remote (Tauri-plugin) path so both surface the same
+ * kinds of messages to the UI.
+ */
+function classifyLocalFetchError(
+  label: string,
+  baseUrl: string,
+  triedUrls: string[],
+  rawMsg: string
+): string {
+  if (rawMsg.startsWith('HTTP 401')) {
+    return `Authentication failed: an API key is required or invalid for ${label}.`
+  }
+  if (rawMsg.startsWith('HTTP 403')) {
+    return `Access forbidden: check your API key permissions for ${label}.`
+  }
+  if (rawMsg.startsWith('HTTP 404')) {
+    return (
+      `Models endpoint not found for ${label}. Tried: ${triedUrls.join(' and ')}. ` +
+      `Check the Base URL — most OpenAI-compatible servers expose models at /v1/models.`
+    )
+  }
+  // reqwest network/transport failures surface as "Request failed: …" or
+  // "Body read failed: …" from the Rust get_local_http command.
+  if (
+    rawMsg.startsWith('Request failed') ||
+    rawMsg.startsWith('Body read failed')
+  ) {
+    return (
+      `Cannot connect to ${label} at ${baseUrl}. ` +
+      `Check that the server is running and the address is correct.`
+    )
+  }
+  return `Cannot fetch models from ${label} at ${baseUrl}: ${rawMsg}`
+}
 
 /**
  * Extract model ids from the parsed body of a `/models` endpoint. Handles the
@@ -204,8 +241,10 @@ export class TauriProvidersService extends DefaultProvidersService {
       throw new Error('Provider must have base_url configured')
     }
 
-    // Normalise: strip trailing slash for consistent URL construction.
-    const baseUrl = provider.base_url.replace(/\/+$/, '')
+    // Normalise: trim surrounding whitespace (a stray trailing space, e.g.
+    // from a paste, otherwise leaks into the path as `/v1 /models` → 404) and
+    // strip trailing slashes for consistent URL construction.
+    const baseUrl = provider.base_url.trim().replace(/\/+$/, '')
     const hasApiKey = Boolean(provider.api_key)
 
     // Build the primary URL and, when the base_url does not already contain a
@@ -251,14 +290,18 @@ export class TauriProvidersService extends DefaultProvidersService {
       })
     }
 
-    // Loopback providers (Ollama, LM Studio, …) go through a Rust `reqwest`
-    // command instead of the Tauri HTTP plugin, whose webview body-streaming
-    // has been observed to hang reading small local responses (e.g. Ollama's
-    // /v1/models returns instantly to curl but times out via the plugin).
-    if (isLoopbackUrl(provider.base_url)) {
-      const urls = fallbackUrl ? [primaryUrl, fallbackUrl] : [primaryUrl]
-      let lastError: unknown
-      for (const url of urls) {
+    // All providers — cloud, self-hosted (vLLM/llama.cpp on a LAN host), and
+    // loopback (Ollama/LM Studio) — go through the Rust `reqwest` command
+    // rather than the Tauri HTTP plugin. The plugin's webview body-streaming
+    // has been observed to hang reading the response for many providers
+    // (GitHub #90 Home-Lab: "Reading response body timed out after 15s" on a
+    // perfectly healthy server). Doing the GET server-side also sidesteps CORS.
+    const urls = fallbackUrl ? [primaryUrl, fallbackUrl] : [primaryUrl]
+    const MAX_ATTEMPTS = 3
+    let lastError: unknown
+
+    for (const url of urls) {
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
           const rawText = await invoke<string>('get_local_http', {
             url,
@@ -267,206 +310,39 @@ export class TauriProvidersService extends DefaultProvidersService {
           })
           const ids = extractModelIds(rawText, provider.provider)
           console.info(
-            `[providers:${provider.provider}] parsed ${ids.length} model ids (url=${url})`
+            `[providers:${provider.provider}] parsed ${ids.length} model ids (url=${url}, attempt=${attempt})`
           )
           return ids
         } catch (err) {
           lastError = err
           const msg = err instanceof Error ? err.message : String(err)
-          // Only fall through to /v1/models on a 404; other errors are terminal.
-          if (!msg.startsWith('HTTP 404')) break
+          console.warn(
+            `[providers:${provider.provider}] get_local_http ${url} failed (attempt ${attempt}): ${msg}`
+          )
+
+          // HTTP status errors (404/401/403/5xx) are deterministic — retrying
+          // the same URL won't help, so stop the retry loop.
+          if (msg.startsWith('HTTP ')) break
+          // Transport errors (connection reset, stale pooled socket, body
+          // read) are worth a quick retry with a fresh request.
+          if (attempt < MAX_ATTEMPTS) {
+            await new Promise((r) => setTimeout(r, 300 * attempt))
+          }
         }
       }
-      const msg =
+
+      // Fall through to the next URL only on a 404 (wrong path → try the
+      // /v1/models fallback). Any other failure stops here.
+      const lastMsg =
         lastError instanceof Error ? lastError.message : String(lastError)
-      throw new Error(
-        `Cannot fetch models from ${provider.provider} at ${baseUrl}: ${msg}`
-      )
+      if (!lastMsg.startsWith('HTTP 404')) break
     }
 
-    // Hard timeout: the Tauri HTTP plugin does not always honour
-    // AbortSignal on macOS, so we race the request against a manual timer.
-    // 30s accommodates slow providers (OpenRouter's /models has been
-    // observed at 8-19s) while still bounding the UI spinner.
-    const FETCH_MODELS_TIMEOUT_MS = 30000
-
-    // Helper: fire a single GET request with timeout, return the Response.
-    // Throws on network error or timeout — does NOT throw on non-2xx status.
-    const fetchUrl = async (url: string): Promise<Response> => {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), FETCH_MODELS_TIMEOUT_MS)
-      try {
-        return (await Promise.race([
-          fetchTauri(url, {
-            method: 'GET',
-            headers,
-            signal: controller.signal,
-          }),
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () =>
-                reject(
-                  new Error(
-                    `Request to ${provider.provider} timed out after ${FETCH_MODELS_TIMEOUT_MS / 1000}s. ` +
-                      `The server may be unreachable or too slow to respond.`
-                  )
-                ),
-              FETCH_MODELS_TIMEOUT_MS
-            )
-          ),
-        ])) as Response
-      } finally {
-        clearTimeout(timer)
-      }
-    }
-
-    try {
-      let response: Response
-      let usedUrl = primaryUrl
-
-      // ── Attempt 1: primary URL ──────────────────────────────────────────
-      try {
-        response = await fetchUrl(primaryUrl)
-      } catch (netErr) {
-        // Network-level error on primary (no route, connection refused, …).
-        // A /v1 fallback will not help if the host itself is unreachable, so
-        // surface a readable message immediately.
-        const msg = netErr instanceof Error ? netErr.message : String(netErr)
-        if (msg.startsWith('Request to ') && msg.includes('timed out')) {
-          throw new Error(msg)
-        }
-        throw new Error(
-          `Cannot connect to ${provider.provider} at ${baseUrl}. ` +
-            `Please check that the service is running and the address is correct.`
-        )
-      }
-
-      console.info(
-        `[providers:${provider.provider}] ${response.status} ${response.statusText} (${usedUrl})`
-      )
-
-      // ── Attempt 2: /v1/models fallback on 404 ──────────────────────────
-      // When the primary URL returns 404 and we have not already tried the
-      // /v1 prefix, retry once. This transparently handles the common case
-      // where the user typed http://host:8000 instead of http://host:8000/v1.
-      if (response.status === 404 && fallbackUrl !== null) {
-        console.info(
-          `[providers:${provider.provider}] 404 on ${primaryUrl}, retrying with /v1 fallback: ${fallbackUrl}`
-        )
-        try {
-          const fallbackResponse = await fetchUrl(fallbackUrl)
-          console.info(
-            `[providers:${provider.provider}] ${fallbackResponse.status} ${fallbackResponse.statusText} (${fallbackUrl})`
-          )
-          // Any response from the fallback (even 401/5xx) is more informative
-          // than the original 404, so adopt it.
-          response = fallbackResponse
-          usedUrl = fallbackUrl
-        } catch {
-          // Fallback network error — keep the original 404 response so the
-          // status handling below can produce a coherent message.
-        }
-      }
-
-      // ── Status-code error handling ──────────────────────────────────────
-      if (!response.ok) {
-        if (response.status === 401) {
-          throw new Error(
-            `Authentication failed: API key is required or invalid for ${provider.provider}`
-          )
-        } else if (response.status === 403) {
-          throw new Error(
-            `Access forbidden: Check your API key permissions for ${provider.provider}`
-          )
-        } else if (response.status === 404) {
-          // Both primary and fallback (if attempted) returned 404.
-          const triedList =
-            fallbackUrl !== null
-              ? `${primaryUrl} and ${fallbackUrl}`
-              : primaryUrl
-          throw new Error(
-            `Models endpoint not found for ${provider.provider}. ` +
-              `Tried: ${triedList}. ` +
-              `If your server uses a sub-path, add /v1 to the base URL ` +
-              `(e.g. http://host:8000/v1).`
-          )
-        } else {
-          throw new Error(
-            `Failed to fetch models from ${provider.provider}: ${response.status} ${response.statusText}`
-          )
-        }
-      }
-
-      // The Tauri HTTP plugin has been observed to hang on `response.json()`
-      // for some providers. Read raw text under a timeout, parse synchronously.
-      const BODY_READ_TIMEOUT_MS = 15000
-      const rawText = await Promise.race([
-        response.text(),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () =>
-              reject(
-                new Error(
-                  `Reading response body from ${provider.provider} timed out after ${BODY_READ_TIMEOUT_MS / 1000}s`
-                )
-              ),
-            BODY_READ_TIMEOUT_MS
-          )
-        ),
-      ])
-      console.info(
-        `[providers:${provider.provider}] body received (${rawText.length} bytes, url=${usedUrl})`
-      )
-
-      const collected = extractModelIds(rawText, provider.provider)
-      console.info(
-        `[providers:${provider.provider}] parsed ${collected.length} model ids`
-      )
-      return collected
-    } catch (error) {
-      console.error('Error fetching models from provider:', error)
-
-      // Preserve structured error messages thrown above — they are already
-      // user-readable, so re-throw verbatim without wrapping.
-      const structuredErrorPrefixes = [
-        'Authentication failed',
-        'Access forbidden',
-        'Models endpoint not found',
-        'Failed to fetch models from',
-        'Cannot connect to ',
-        'Request to ',
-        'Reading response body',
-        'Failed to parse JSON',
-      ]
-
-      if (
-        error instanceof Error &&
-        structuredErrorPrefixes.some((prefix) =>
-          (error as Error).message.startsWith(prefix)
-        )
-      ) {
-        throw new Error(error.message)
-      }
-
-      // Classify remaining network-level errors (e.g. from the Tauri IPC
-      // layer) as connection failures.
-      if (
-        error instanceof Error &&
-        (error.message.includes('fetch') ||
-          error.name === 'AbortError' ||
-          error.message.includes('network'))
-      ) {
-        throw new Error(
-          `Cannot connect to ${provider.provider} at ${baseUrl}. ` +
-            `Please check that the service is running and the address is correct.`
-        )
-      }
-
-      // Generic fallback
-      throw new Error(
-        `Unexpected error while fetching models from ${provider.provider}: ${error instanceof Error ? error.message : 'Unknown error'}`
-      )
-    }
+    const msg =
+      lastError instanceof Error ? lastError.message : String(lastError)
+    throw new Error(
+      classifyLocalFetchError(provider.provider, baseUrl, urls, msg)
+    )
   }
 
   async updateSettings(
