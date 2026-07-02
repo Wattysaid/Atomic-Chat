@@ -25,7 +25,13 @@ import {
   shouldEmitModelLoadFailure,
 } from '@/lib/telemetry'
 import { captureHandledError } from '@/lib/sentry'
-import { getProviderTitle } from '@/lib/utils'
+import {
+  getProviderTitle,
+  MODEL_LOAD_WATCHDOG_MS,
+  OPERATION_TIMED_OUT_CODE,
+  SERVER_START_WATCHDOG_MS,
+  withTimeout,
+} from '@/lib/utils'
 
 type ModelSettingEntry = { controller_props?: { value?: unknown } }
 type LoadableModel = {
@@ -113,6 +119,37 @@ type LocalProviderName = (typeof LOCAL_PROVIDERS)[number]
 
 function isLocalEngineProvider(providerName: string): boolean {
   return (LOCAL_PROVIDERS as readonly string[]).includes(providerName)
+}
+
+// ATO-270: `doSwitchToModel` has no ceiling on how long it waits for the
+// model to load or the proxy server to start — if either step gets stuck on
+// an un-timeboxed network call somewhere in backend preparation, the promise
+// never settles and the "Starting Server" UI (`serverStatus === 'pending'`)
+// hangs forever, with no error and no way to retry. `MODEL_LOAD_WATCHDOG_MS`
+// / `SERVER_START_WATCHDOG_MS` (see `@/lib/utils`) are a last-resort safety
+// net, not a replacement for fixing the underlying stall: on expiry the
+// `catch` block below runs exactly as it would for any other failure
+// (status reset, toast, telemetry) instead of leaving the app stuck.
+const LOCAL_API_SERVER_START_TIMEOUT_CODE = 'LOCAL_API_SERVER_START_TIMEOUT'
+
+/** Re-tags a `withTimeout` expiry with the ATO-270-specific error code used
+ * to force a toast even on auto-start (see `reportModelLoadError`), while
+ * leaving every other rejection (a genuine failure, not a timeout) untouched. */
+function taggedWithTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string
+): Promise<T> {
+  return withTimeout(promise, ms, message).catch((error: unknown) => {
+    if (
+      error &&
+      typeof error === 'object' &&
+      (error as { code?: string }).code === OPERATION_TIMED_OUT_CODE
+    ) {
+      (error as { code?: string }).code = LOCAL_API_SERVER_START_TIMEOUT_CODE
+    }
+    throw error
+  })
 }
 
 function setLastUsedModel(provider: string, model: string) {
@@ -412,7 +449,11 @@ async function doSwitchToModel(params: {
     if (isLocal) {
       // 4a. Local branch — load the model into its engine.
       loadStartTs = Date.now()
-      await serviceHub.models().startModel(provider, modelId, true)
+      await taggedWithTimeout(
+        serviceHub.models().startModel(provider, modelId, true),
+        MODEL_LOAD_WATCHDOG_MS,
+        `Timed out waiting for model "${modelId}" to finish loading.`
+      )
       emitModelLoad('success', {
         modelId,
         providerName,
@@ -434,7 +475,7 @@ async function doSwitchToModel(params: {
     }
 
     // 5. Start the Local API Server.
-    const actualPort = await window.core?.api?.startServer({
+    const startServerCall = window.core?.api?.startServer({
       host: serverState.serverHost,
       port: serverState.serverPort,
       prefix: serverState.apiPrefix,
@@ -443,7 +484,14 @@ async function doSwitchToModel(params: {
       isCorsEnabled: serverState.corsEnabled,
       isVerboseEnabled: serverState.verboseLogs,
       proxyTimeout: serverState.proxyTimeout,
-    })
+    }) as Promise<number> | undefined
+    const actualPort = startServerCall
+      ? await taggedWithTimeout(
+          startServerCall,
+          SERVER_START_WATCHDOG_MS,
+          'Timed out waiting for the Local API Server to start.'
+        )
+      : undefined
     console.log('[switchToModel] Server started on port:', actualPort)
 
     if (actualPort && actualPort !== serverState.serverPort) {
@@ -615,13 +663,29 @@ function reportModelLoadError(
   const err = toErrorObject(rawError)
   useModelLoad.getState().setModelLoadError(err, modelId)
 
-  // Only user-initiated loads surface a toast. Automatic/background loads
-  // (startup auto-start, ChatInput auto-start, onboarding launches, post-import
-  // auto-switch) pass `isAutoStart` and fail silently — the error is still
-  // stored above for any inline UI that wants to read it.
-  if (isAutoStart) return
-
   const t = i18n.t.bind(i18n)
+
+  // ATO-270: a startup watchdog timeout must surface even on auto-start —
+  // the alternative is an infinite "Starting Server" spinner with zero
+  // feedback and no way for the user to know anything went wrong, let alone
+  // retry. This is the one exception to the "auto-start fails silently"
+  // policy below.
+  if (err.code === LOCAL_API_SERVER_START_TIMEOUT_CODE) {
+    toast.error(t('model-errors:startupTimedOutTitle'), {
+      id: 'model-load-error',
+      description: t('model-errors:startupTimedOutDescription'),
+      duration: 10000,
+      closeButton: true,
+    })
+    return
+  }
+
+  // Only user-initiated loads surface a toast for every other failure.
+  // Automatic/background loads (startup auto-start, ChatInput auto-start,
+  // onboarding launches, post-import auto-switch) pass `isAutoStart` and
+  // fail silently — the error is still stored above for any inline UI that
+  // wants to read it.
+  if (isAutoStart) return
 
   if (isOutOfMemoryError(err)) {
     toast.error(t('model-errors:outOfMemoryTitle'), {
