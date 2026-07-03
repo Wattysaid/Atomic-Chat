@@ -168,6 +168,16 @@ function modelLoadReadyTimeoutSecs(configuredTimeoutSecs: number): number {
   return Math.max(base, MODEL_LOAD_READY_TIMEOUT_FLOOR_SECS)
 }
 
+/// Temporary hard pin: every launch forcibly reconciles `version_backend`
+/// to this exact ggml-org tag, preserving the user's backend *type*
+/// (cpu/cuda/vulkan/macos-arm64) but never their *version* — this WILL
+/// downgrade a newer manually-installed backend just as readily as it
+/// upgrades an older one. Mirrors the CI/build pins in `Makefile`
+/// (`LLAMACPP_UPSTREAM_TAG`) and `atomic-chat-conf/backends/manifest.json`
+/// (`tag_name`). Remove (or move to a real settings-driven pin) once the
+/// team is done validating this tag broadly. See `enforcePinnedBackendVersion`.
+const PINNED_BACKEND_TAG = 'b9702'
+
 /**
  * Override the default app.log function to use Jan's logging system.
  * @param args
@@ -551,6 +561,11 @@ export default class llamacpp_upstream_extension extends AIEngine {
         //! Раньше отклонённый промис терялся; без лога сложно понять вечный «loading» в настройках.
         logger.error('configureBackends failed:', err)
       })
+      // Runs after every launch resolves a concrete `version_backend`, to
+      // forcibly reconcile it to `PINNED_BACKEND_TAG`. Chained onto the
+      // same promise so callers awaiting `configureBackendsPromise` also
+      // observe the pin before touching the backend.
+      .then(() => this.enforcePinnedBackendVersion())
       .finally(() => {
         this.isInitializing = false
         this.configureBackendsPromise = null
@@ -1314,6 +1329,52 @@ export default class llamacpp_upstream_extension extends AIEngine {
       // which is invoked only by user-driven UI surfaces.
     } finally {
       this.isConfiguringBackends = false
+    }
+  }
+
+  /**
+   * Forcibly reconciles the active backend to `PINNED_BACKEND_TAG`,
+   * preserving the user's current backend *type* (cpu/cuda/vulkan/
+   * macos-arm64) — never their version. Runs once per launch, after
+   * `configureBackends()` has resolved a concrete `version_backend`.
+   *
+   * This is a hard pin: it downgrades a newer manually-installed backend
+   * just as readily as it upgrades an older one. If the pinned tag has no
+   * asset for the user's current type (e.g. a type removed upstream), the
+   * download/hot-swap fails and is logged, leaving the working backend
+   * untouched rather than bricking the install.
+   */
+  private async enforcePinnedBackendVersion(): Promise<void> {
+    try {
+      const current = stripBom(this.config.version_backend || '')
+      if (!isConcreteVersionBackend(current)) {
+        logger.info(
+          'enforcePinnedBackendVersion: no concrete backend configured yet, skipping'
+        )
+        return
+      }
+
+      const slashIdx = current.indexOf('/')
+      const currentTag = current.slice(0, slashIdx)
+      const currentType = current.slice(slashIdx + 1)
+
+      if (currentTag === PINNED_BACKEND_TAG) {
+        return
+      }
+
+      const target = `${PINNED_BACKEND_TAG}/${currentType}`
+      logger.info(
+        `enforcePinnedBackendVersion: pinning backend '${current}' -> '${target}'`
+      )
+      await this.downloadRecommendedBackend(target)
+      logger.info(
+        `enforcePinnedBackendVersion: backend pinned to '${target}'`
+      )
+    } catch (err) {
+      logger.error(
+        'enforcePinnedBackendVersion: failed to pin backend version (keeping current backend):',
+        err
+      )
     }
   }
 
