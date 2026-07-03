@@ -22,7 +22,12 @@ import { useModelLoad } from '@/hooks/useModelLoad'
 import { isOnboardingPending } from '@/lib/onboarding'
 import { ensureRegistryLoaded } from '@/stores/provider-registry-store'
 import { consumeSilentImport } from '@/utils/backgroundImports'
-import { isDev, LOCAL_LLAMACPP_PROVIDER } from '@/lib/utils'
+import {
+  isDev,
+  LOCAL_LLAMACPP_PROVIDER,
+  SERVER_START_WATCHDOG_MS,
+  withTimeout,
+} from '@/lib/utils'
 import { AppEvent, events, ModelEvent } from '@janhq/core'
 import { toast } from 'sonner'
 import { SystemEvent } from '@/types/events'
@@ -734,7 +739,10 @@ export function DataProvider() {
           )
           setServerStatus('pending')
           try {
-            const actualPort = await window.core?.api?.startServer({
+            // ATO-270: never let a stuck native invoke leave the UI on
+            // "Starting Server" forever — see the watchdog note next to
+            // `switchToModel` for why this needs a ceiling at all.
+            const startServerCall = window.core?.api?.startServer({
               host: serverState.serverHost,
               port: serverState.serverPort,
               prefix: serverState.apiPrefix,
@@ -743,7 +751,14 @@ export function DataProvider() {
               isCorsEnabled: serverState.corsEnabled,
               isVerboseEnabled: serverState.verboseLogs,
               proxyTimeout: serverState.proxyTimeout,
-            })
+            }) as Promise<number> | undefined
+            const actualPort = startServerCall
+              ? await withTimeout(
+                  startServerCall,
+                  SERVER_START_WATCHDOG_MS,
+                  'Timed out waiting for the Local API Server to start.'
+                )
+              : undefined
             if (actualPort && actualPort !== serverState.serverPort) {
               serverState.setServerPort(actualPort)
             }
