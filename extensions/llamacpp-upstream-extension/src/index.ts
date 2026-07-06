@@ -38,6 +38,7 @@ import {
   cleanupIncompleteBackends,
   fetchRemoteBackends,
   friendlyBackendLabel,
+  getBackendArchiveName,
   getBackendDownloadUrl,
   getCudartDownloadUrl,
   getCudartArchiveName,
@@ -150,6 +151,12 @@ const ERR_MODEL_FILE_CORRUPT = 'MODEL_FILE_CORRUPT'
 /// was disabled for this model on the current backend.
 const MULTIMODAL_DISABLED_FALLBACK =
   'local_backend://multimodal_disabled_fallback'
+
+/// Tauri event emitted by the Rust watcher task when a llama-server child
+/// process (PID tracked in LlamacppState::process_map) that was running a
+/// loaded model exits unexpectedly during generation (ATO-244).
+/// Payload: `{ model_id: string, pid: number, error_code: string, message: string }`.
+const SESSION_DIED_EVENT = 'local_backend://llamacpp_upstream_session_died'
 
 /// MODEL_LOAD_TIMED_OUT (ATO-188): large models on slow / cold storage can take
 /// longer than the configured connection timeout (default 600s) to finish
@@ -400,6 +407,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
   private modelMaxCtxTrain = new Map<string, number>()
   private unlistenValidationStarted?: () => void
   private unlistenAutoIncreaseCtx?: () => void
+  private unlistenSessionDied?: () => void
 
   override async onLoad(): Promise<void> {
     super.onLoad() // Calls registerEngine() from AIEngine
@@ -554,6 +562,22 @@ export default class llamacpp_upstream_extension extends AIEngine {
         void this.handleAutoIncreaseCtx(event.payload)
       }
     )
+
+    // ATO-244: Rust post-load watcher task emits this event when a
+    // llama-server child that was running (model already loaded) exits
+    // unexpectedly during generation (e.g. Vulkan GPU crash / SIGSEGV).
+    // Clean up internal session state so the extension stays consistent.
+    // `DataProvider.tsx` listens to this same Rust-emitted event directly to
+    // show the crash toast — see the doc comment on `handleSessionDied` for
+    // why this handler must NOT re-emit it.
+    this.unlistenSessionDied = await listen<{
+      model_id: string
+      pid: number
+      error_code: string
+      message: string
+    }>(SESSION_DIED_EVENT, (event) => {
+      void this.handleSessionDied(event.payload)
+    })
 
     //* configureBackends может долго качать движок — не await, иначе весь UI ждёт завершения.
     this.configureBackendsPromise = this.configureBackends()
@@ -2281,6 +2305,9 @@ export default class llamacpp_upstream_extension extends AIEngine {
     }
     if (this.unlistenAutoIncreaseCtx) {
       this.unlistenAutoIncreaseCtx()
+    }
+    if (this.unlistenSessionDied) {
+      this.unlistenSessionDied()
     }
   }
 
@@ -4066,6 +4093,64 @@ export default class llamacpp_upstream_extension extends AIEngine {
 
   /// Bridge from the Local API Server proxy (Rust) back to the extension
   /// when a forwarded request exhausts the model's context window. We
+  /// Handle an unexpected llama-server process exit that happened AFTER the
+  /// model had finished loading (i.e. during active generation). The Rust
+  /// post-load watcher task emits `SESSION_DIED_EVENT` and has already
+  /// removed the session entry from the Rust `process_map`.
+  ///
+  /// Responsibilities here:
+  ///  1. Clean up extension-level state (sessionCache, modelCtxSize) so
+  ///     the extension does not believe the model is still loaded.
+  ///  2. Attempt `this.unload()` for any remaining state cleanup (it will
+  ///     succeed even if the process is already gone — Rust returns "not
+  ///     found → success" in that case).
+  ///
+  /// Does NOT re-emit `SESSION_DIED_EVENT` on the Tauri bus: the Rust watcher
+  /// already emitted it once via `app_handle.emit(...)`, which is a
+  /// webview-wide broadcast that this extension's own `listen(SESSION_DIED_EVENT,
+  /// ...)` subscription (see onLoad) also receives directly — no relay needed.
+  /// A prior version of this method re-emitted the event "just in case",
+  /// which — because the extension listens to that very channel — caused the
+  /// re-emit to retrigger this same handler, which re-emitted again,
+  /// indefinitely. That infinite loop of no-op unload + emit calls pegged the
+  /// event loop (observed as the whole app hanging) and kept resurfacing the
+  /// crash toast / racing with a subsequent legitimate reload attempt (seen
+  /// as a spurious "Server is already running" toast on top of a model that
+  /// had actually reloaded fine). `DataProvider.tsx` listens to the raw Rust
+  /// event directly and needs nothing further from this method.
+  private async handleSessionDied(payload: {
+    model_id: string
+    pid: number
+    error_code: string
+    message: string
+  }): Promise<void> {
+    const { model_id, error_code, message } = payload
+    logger.warn(
+      `[sessionDied] llamacpp-upstream: model='${model_id}' crashed during generation ` +
+        `(code=${error_code}): ${message}`
+    )
+
+    // Best-effort unload first — it will look up the session in sessionCache,
+    // call Rust's unload (a no-op there since the watcher already removed the
+    // entry from process_map, which returns success), and then clean up
+    // sessionCache itself.
+    try {
+      await this.unload(model_id)
+    } catch (e) {
+      // Expected when the watcher already removed the entry from both the Rust
+      // process_map and sessionCache has no entry. Manually clean up.
+      this.sessionCache.delete(model_id)
+      logger.warn(`[sessionDied] unload for '${model_id}' was a no-op (already cleaned): ${e}`)
+    }
+
+    // modelCtxSize is not touched by unload(); clear it here.
+    this.modelCtxSize.delete(model_id)
+    // Keep modelMaxCtxTrain — it's read from the GGUF header and doesn't change.
+
+    // Intentionally no re-emit of SESSION_DIED_EVENT here — see the doc
+    // comment above this method for why that used to cause an infinite loop.
+  }
+
   /// unload + reload the model with a larger ctx_size, inform the proxy via
   /// a request-scoped done event, and notify the web-app UI so the Zustand
   /// provider store mirrors the new value (so the next UI interaction keeps
@@ -4540,7 +4625,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
     if (!(await fs.existsSync(tempDir))) {
       await fs.mkdir(tempDir)
     }
-    const archiveName = `llama-${version}-bin-${backend}.zip`
+    const archiveName = getBackendArchiveName(version, backend)
     const archivePath = await joinPath([tempDir, archiveName])
     const targetDir = await getBackendDir(backend, version)
 
@@ -4640,6 +4725,10 @@ export default class llamacpp_upstream_extension extends AIEngine {
       })
 
       const exeName = IS_WINDOWS ? 'llama-server.exe' : 'llama-server'
+      await invoke('normalize_backend_layout', {
+        outputDir: targetDir,
+        exeName,
+      })
       const expectedBin = await joinPath([targetDir, 'build', 'bin', exeName])
 
       if (!(await fs.existsSync(expectedBin))) {
@@ -4676,6 +4765,45 @@ export default class llamacpp_upstream_extension extends AIEngine {
             const src = await joinPath([targetDir, baseName])
             const dst = await joinPath([buildBinDir, baseName])
             await fs.mv(src, dst)
+          }
+        } else {
+          // Linux ggml-org tarballs can extract into a nested top-level
+          // directory such as `llama-b9691/` with `llama-server` and shared
+          // libraries inside it. Normalize that layout to the same
+          // `<backend>/build/bin/` shape used by bundled backends.
+          const entries = (await fs.readdirSync(targetDir)) as string[]
+          const nestedDirEntry = entries.find((rawEntry) => {
+            const baseName = rawEntry.split(/[/\\]/).filter(Boolean).pop()
+            return baseName?.startsWith('llama-')
+          })
+          if (nestedDirEntry) {
+            const nestedBaseName = nestedDirEntry
+              .split(/[/\\]/)
+              .filter(Boolean)
+              .pop()
+            if (nestedBaseName) {
+              const nestedDir = await joinPath([targetDir, nestedBaseName])
+              const nestedBin = await joinPath([nestedDir, exeName])
+              if (await fs.existsSync(nestedBin)) {
+                logger.info(
+                  `Relocating nested backend layout ${nestedBaseName}/ into build/bin/`
+                )
+                const buildBinDir = await joinPath([targetDir, 'build', 'bin'])
+                await fs.mkdir(buildBinDir)
+                const nestedEntries = (await fs.readdirSync(nestedDir)) as string[]
+                for (const rawNestedEntry of nestedEntries) {
+                  const baseName = rawNestedEntry
+                    .split(/[/\\]/)
+                    .filter(Boolean)
+                    .pop()
+                  if (!baseName) continue
+                  const src = await joinPath([nestedDir, baseName])
+                  const dst = await joinPath([buildBinDir, baseName])
+                  await fs.mv(src, dst)
+                }
+                await fs.rm(nestedDir)
+              }
+            }
           }
         }
       }

@@ -578,6 +578,70 @@ export function DataProvider() {
     }
   }, [])
 
+  // ATO-244: Listen for unexpected llama-server crashes that happen AFTER
+  // model load (i.e. during generation). The Rust post-load watcher emits
+  // `local_backend://llamacpp_upstream_session_died` when this occurs.
+  // Show an actionable toast so the user knows why generation stopped.
+  useEffect(() => {
+    if (!IS_TAURI) return
+
+    let unlistenSessionDied: (() => void) | undefined
+    let cancelled = false
+    ;(async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event')
+        if (cancelled) return
+        const unsub = await listen<{
+          model_id?: string
+          error_code?: string
+          message?: string
+        }>('local_backend://llamacpp_upstream_session_died', (event) => {
+          const { model_id } = event.payload ?? {}
+          console.warn(
+            '[LocalAPI] llamacpp_upstream_session_died:',
+            event.payload
+          )
+          // ATO-244: the backend process is gone, but `useAppState.activeModels`
+          // (the store every "is this model running?" check in the UI reads
+          // from — ChatInput's auto-start effect, the status dot, etc.) still
+          // lists it as active until something re-queries the engine. Without
+          // this, a "New chat" on the same model/provider never re-checks
+          // (its auto-start effect only reruns on model/provider change) and
+          // just sends straight into the dead backend, surfacing a raw
+          // "Connection refused" instead of silently reloading. Dropping the
+          // model here flips `isModelActive` to false, which re-triggers that
+          // effect and lets it restart the model on its own.
+          if (model_id) {
+            const { activeModels, setActiveModels } = useAppState.getState()
+            if (activeModels.includes(model_id)) {
+              setActiveModels(activeModels.filter((id) => id !== model_id))
+            }
+          }
+          toast.error('Model crashed during generation', {
+            id: `session-died-${model_id ?? 'unknown'}`,
+            description:
+              "The model's backend process exited unexpectedly. This can happen with Vulkan backends on some GPU drivers. Try reloading the model, or switch to a CPU backend in Settings → Providers.",
+          })
+        })
+        if (cancelled) {
+          unsub()
+          return
+        }
+        unlistenSessionDied = unsub
+      } catch (e) {
+        console.warn(
+          '[LocalAPI] Failed to subscribe to llamacpp_upstream_session_died:',
+          e
+        )
+      }
+    })()
+
+    return () => {
+      cancelled = true
+      if (unlistenSessionDied) unlistenSessionDied()
+    }
+  }, [])
+
   // Auto-start Local API Server on app startup. Works for both local engines
   // (llamacpp/mlx) and cloud providers: when the last-used model is cloud we
   // just raise the proxy and register the provider config so it can route
