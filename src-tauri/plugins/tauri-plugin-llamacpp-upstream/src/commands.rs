@@ -38,6 +38,29 @@ pub struct UnloadResult {
     error: Option<String>,
 }
 
+/// Returns true if a llama-server log line (stdout or stderr, already
+/// lowercased) indicates the HTTP server has started listening.
+///
+/// Upstream `ggml-org/llama.cpp` has changed the exact wording of this
+/// message before without warning (e.g. commit `27c8bb4f6`, first
+/// released in `b9829`, dropped "server is" from "server is listening
+/// on ..." down to a bare "listening on ..."), which silently broke
+/// readiness detection here and caused loads to hang for the full
+/// `timeout_duration` before failing. Matching on the stable substring
+/// "listening on" (present in every historical variant: "server is
+/// listening on", "server listening on", "router server is listening
+/// on", and the current bare "listening on") is robust to any further
+/// upstream rewording of the surrounding words. `/health` is the
+/// primary, wording-independent readiness signal (see the HTTP poll in
+/// `load_llama_model_impl`); this log-based check is a fast, low-cost
+/// complement to it and a fallback for it.
+fn is_ready_log_line(line_lower: &str) -> bool {
+    line_lower.contains("listening on")
+        || line_lower.contains("all slots are idle")
+        || line_lower.contains("starting the main loop")
+        || line_lower.contains("http server listening")
+}
+
 /// Core model loading logic usable without an AppHandle (CLI / test support).
 pub async fn load_llama_model_impl(
     process_map_arc: Arc<Mutex<HashMap<i32, LLamaBackendSession>>>,
@@ -150,10 +173,7 @@ pub async fn load_llama_model_impl(
 
                     // Check for readiness indicators
                     let line_lower = line.to_lowercase();
-                    if line_lower.contains("http server listening")
-                        || line_lower.contains("all slots are idle")
-                        || line_lower.contains("starting the main loop")
-                    {
+                    if is_ready_log_line(&line_lower) {
                         log::info!("Server appears to be ready based on stdout: '{}'", line);
                         let _ = stdout_ready_tx.send(true).await;
                     }
@@ -167,6 +187,7 @@ pub async fn load_llama_model_impl(
     });
 
     // Spawn task to capture stderr and monitor for errors
+    let stderr_ready_tx = ready_tx.clone();
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut byte_buffer = Vec::new();
@@ -187,12 +208,9 @@ pub async fn load_llama_model_impl(
 
                         // Check for readiness indicator
                         let line_lower = line.to_string().to_lowercase();
-                        if line_lower.contains("server is listening on")
-                            || line_lower.contains("starting the main loop")
-                            || line_lower.contains("server listening on")
-                        {
+                        if is_ready_log_line(&line_lower) {
                             log::info!("Model appears to be ready based on logs: '{}'", line);
-                            let _ = ready_tx.send(true).await;
+                            let _ = stderr_ready_tx.send(true).await;
                         }
                     }
                 }
@@ -206,9 +224,43 @@ pub async fn load_llama_model_impl(
         stderr_buffer
     });
 
+    // Poll the /health endpoint as a version-independent readiness signal,
+    // complementing the log-line matchers above. Upstream has changed the
+    // "listening" log wording before with no warning (see `is_ready_log_line`)
+    // and could again; `/health` is a stable contract across every llama.cpp
+    // version we've observed — HTTP 503 with a JSON error body while the
+    // model is loading, HTTP 200 with `{"status":"ok"}` once ready — so this
+    // path keeps working even if every log-based matcher above goes stale.
+    let health_ready_tx = ready_tx.clone();
+    let health_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Failed to build health-check HTTP client: {}", e);
+                return;
+            }
+        };
+        let url = format!("http://127.0.0.1:{}/health", port);
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Ok(resp) = client.get(&url).send().await {
+                if resp.status().is_success() {
+                    log::info!("Server appears to be ready based on /health check");
+                    let _ = health_ready_tx.send(true).await;
+                    break;
+                }
+            }
+        }
+    });
+
     // Check if process exited early
     if let Some(status) = child.try_wait()? {
         if !status.success() {
+            health_task.abort();
             let stderr_output = stderr_task.await.unwrap_or_default();
             // WS1.1/WS3.2: warn! (not error!) so the SentryLogger bridge does not
             // raise a duplicate crash event — the structured error returned below
@@ -230,12 +282,14 @@ pub async fn load_llama_model_impl(
             // Server is ready
             Some(true) = ready_rx.recv() => {
                 log::info!("Model is ready to accept requests!");
+                health_task.abort();
                 break;
             }
             // Check for process exit more frequently
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 // Check if process exited
                 if let Some(status) = child.try_wait()? {
+                    health_task.abort();
                     let stderr_output = stderr_task.await.unwrap_or_default();
                     if !status.success() {
                         // WS1.1: warn! (not error!) — the structured error returned
@@ -254,6 +308,7 @@ pub async fn load_llama_model_impl(
                 // Timeout check
                 if start_time.elapsed() > timeout_duration {
                     log::error!("Timeout waiting for server to be ready");
+                    health_task.abort();
                     let _ = child.kill().await;
                     let stderr_output = stderr_task.await.unwrap_or_default();
                     return Err(LlamacppError::new(
