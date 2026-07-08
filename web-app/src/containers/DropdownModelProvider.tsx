@@ -26,6 +26,7 @@ import { EMBEDDING_MODEL_ID } from '@/constants/models'
 import { useServiceHub } from '@/hooks/useServiceHub'
 import { getLastUsedModel } from '@/utils/getModelToStart'
 import { switchToModel } from '@/utils/switchModel'
+import { useGeneralSetting } from '@/hooks/useGeneralSetting'
 import { ChevronsUpDown } from 'lucide-react'
 
 interface SearchableModel {
@@ -145,6 +146,33 @@ const DropdownModelProvider = memo(function DropdownModelProvider({
   useEffect(() => {
     const initializeModel = async () => {
       if (selectedProvider && selectedModel) {
+        return
+      }
+
+      const { preloadModelOnStartup } = useGeneralSetting.getState()
+      if (!preloadModelOnStartup) {
+        // Preload is disabled: don't pre-select the last used model or
+        // auto-pick the first local model. Only reflect a model that is
+        // already actively running (e.g. started manually earlier in the
+        // session); otherwise leave the selector blank.
+        try {
+          const activeModelIds = await serviceHub.models().getActiveModels()
+          const activeModelId = activeModelIds?.[0]
+          if (activeModelId) {
+            const activeProvider = providers.find(
+              (p) =>
+                p.active && p.models.some((m) => m.id === activeModelId)
+            )
+            if (activeProvider) {
+              selectModelProvider(activeProvider.provider, activeModelId)
+              setLastUsedModel(activeProvider.provider, activeModelId)
+              return
+            }
+          }
+        } catch (error) {
+          console.debug('Error checking active models on startup:', error)
+        }
+        selectModelProvider('', '')
         return
       }
 

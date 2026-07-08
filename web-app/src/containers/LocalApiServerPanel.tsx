@@ -46,6 +46,8 @@ export function LocalApiServerPanel() {
   const { t } = useTranslation()
   const serviceHub = useServiceHub()
   const {
+    enableOnStartup,
+    setEnableOnStartup,
     corsEnabled,
     setCorsEnabled,
     verboseLogs,
@@ -323,6 +325,20 @@ export function LocalApiServerPanel() {
             </h2>
           </div>
           <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <p className="text-sm font-medium">
+                  {t('settings:localApiServer.autoStart')}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {t('settings:localApiServer.autoStartDesc')}
+                </p>
+              </div>
+              <Switch
+                checked={enableOnStartup}
+                onCheckedChange={setEnableOnStartup}
+              />
+            </div>
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
                 <p className="text-sm font-medium">

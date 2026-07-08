@@ -209,6 +209,8 @@
     "trustedHosts": "Trusted Hosts",
     "trustedHostsDesc": "Addresses this server can be reached at (its own LAN IP or hostname, e.g. 192.168.1.100, my-host) — not the address of the client connecting to it. Separate multiple entries with commas. Use * to allow all hosts. Wildcard and CIDR patterns (e.g. 10.*.*.*, 192.168.0.0/16) are not supported.",
     "advancedSettings": "Advanced Settings",
+    "autoStart": "Auto-start Local API Server",
+    "autoStartDesc": "Automatically start the local API server for the current model.",
     "cors": "Cross-Origin Resource Sharing (CORS)",
     "corsDesc": "Allow cross-origin requests to the API server.",
     "verboseLogs": "Verbose Server Logs",
