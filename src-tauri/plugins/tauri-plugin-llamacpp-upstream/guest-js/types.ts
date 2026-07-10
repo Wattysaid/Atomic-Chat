@@ -60,6 +60,26 @@ export type LlamacppConfig = {
    * built-in MTP (head inside the same GGUF).
    */
   mtp_draft_path: string
+  dflash: boolean
+  /**
+   * Whether the installed backend binary advertises `--spec-type draft-dflash`.
+   * The extension probes `llama-server -h` before loading and sets this field;
+   * Rust keeps the default false so stale configs cannot crash older binaries.
+   */
+  dflash_spec_supported: boolean
+  /**
+   * Absolute path to a DFlash draft GGUF (multi-layer draft speculative
+   * decoding). When set (and `dflash` is on), the backend is launched with
+   * `--model-draft <path> --spec-type draft-dflash`. Resolved/downloaded by
+   * the extension, mirrors `mtp_draft_path`.
+   */
+  dflash_draft_path: string
+  /**
+   * `--spec-draft-n-max` value, computed by the extension from the user's
+   * block-size setting (n_max = block_size - 1). 0 means "use the Rust
+   * default".
+   */
+  dflash_n_max: number
   no_mmap: boolean
   mlock: boolean
   no_kv_offload: boolean
@@ -111,6 +131,11 @@ export interface ModelConfig {
    * and for Qwen-style built-in MTP.
    */
   mtp_draft_path?: string
+  /**
+   * Path (relative to Jan's data folder) to the downloaded DFlash draft GGUF,
+   * if DFlash was enabled for this model. Absent for non-DFlash models.
+   */
+  dflash_draft_path?: string
   source?: string
 }
 

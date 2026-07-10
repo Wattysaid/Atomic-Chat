@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 fn default_parallel() -> i32 {
-     1
- }
+    1
+}
 
 fn default_concurrent_slots() -> i32 {
     8
@@ -72,6 +72,22 @@ pub struct LlamacppConfig {
     /// (head inside the same GGUF), which keeps using the `MTP_MIN_BUILD` gate.
     #[serde(default)]
     pub mtp_draft_path: String,
+    /// Enable DFlash multi-layer draft speculative decoding. Kept for config
+    /// compatibility; the extension probes the installed binary before load.
+    #[serde(default)]
+    pub dflash: bool,
+    /// True only when the installed llama-server advertises
+    /// `--spec-type draft-dflash` in its help output.
+    #[serde(default)]
+    pub dflash_spec_supported: bool,
+    /// Absolute path to a DFlash draft GGUF, resolved+downloaded by the TS
+    /// extension (mirrors `mtp_draft_path`).
+    #[serde(default)]
+    pub dflash_draft_path: String,
+    /// `--spec-draft-n-max` value, computed by TS from the user's block-size
+    /// setting (n_max = block_size - 1). 0 means "use the Rust default".
+    #[serde(default)]
+    pub dflash_n_max: u32,
 }
 
 /// Minimum llama.cpp build number that changed --flash-attn from a boolean
@@ -135,8 +151,9 @@ impl ArgumentBuilder {
 
     /// Standard cache types supported by upstream llama.cpp.
     /// Extended types like `turbo3` are only available in turboquant builds.
-    const STANDARD_CACHE_TYPES: &'static [&'static str] =
-        &["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"];
+    const STANDARD_CACHE_TYPES: &'static [&'static str] = &[
+        "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+    ];
 
     fn sanitize_cache_type(&self, value: &str) -> String {
         if Self::STANDARD_CACHE_TYPES.contains(&value) || self.is_turboquant() {
@@ -242,9 +259,20 @@ impl ArgumentBuilder {
         // Parallel sequences
         self.add_parallel_settings();
 
-        // MTP speculative decoding (must come before embedding/text branch
-        // so the toggle is honored uniformly; method itself skips embedding).
-        self.add_mtp_args();
+        // MTP / DFlash speculative decoding (must come before embedding/text
+        // branch so the toggle is honored uniformly; each method skips
+        // embedding). Mutual exclusivity: the UI enforces a mutex, but as
+        // defense-in-depth we prefer DFlash (the newer, more general
+        // mechanism) and skip MTP when both are somehow enabled.
+        if self.config.dflash && self.config.mtp {
+            log::warn!(
+                "Both MTP and DFlash are enabled; applying DFlash only and skipping MTP (DFlash takes precedence)"
+            );
+            self.add_dflash_args();
+        } else {
+            self.add_mtp_args();
+            self.add_dflash_args();
+        }
 
         // Prometheus /metrics endpoint
         self.add_metrics_flag();
@@ -493,6 +521,45 @@ impl ArgumentBuilder {
         self.args.push("2".to_string());
     }
 
+    /// DFlash is emitted only after the extension probes the installed
+    /// llama-server binary and confirms that `draft-dflash` is accepted.
+    fn add_dflash_args(&mut self) {
+        if !self.config.dflash {
+            return;
+        }
+        if self.is_embedding {
+            return;
+        }
+        if self.config.dflash_draft_path.is_empty() {
+            log::warn!(
+                "DFlash requested but no draft GGUF path is set; skipping --model-draft / --spec-type draft-dflash"
+            );
+            return;
+        }
+        if !self.config.dflash_spec_supported {
+            log::warn!(
+                "DFlash requested for backend {}/{} but this llama.cpp build does not advertise --spec-type draft-dflash; loading without DFlash",
+                self.version,
+                self.backend
+            );
+            return;
+        }
+
+        self.args.push("--model-draft".to_string());
+        self.args.push(self.config.dflash_draft_path.clone());
+        self.args.push("--spec-type".to_string());
+        self.args.push("draft-dflash".to_string());
+        self.args.push("--spec-draft-n-max".to_string());
+        self.args.push(
+            if self.config.dflash_n_max > 0 {
+                self.config.dflash_n_max
+            } else {
+                15
+            }
+            .to_string(),
+        );
+    }
+
     /// Emits `--metrics` when the user explicitly requested Prometheus
     /// metrics (directly or via Concurrent Mode).
     fn add_metrics_flag(&mut self) {
@@ -660,6 +727,10 @@ mod tests {
             expose_metrics: false,
             mtp: false,
             mtp_draft_path: String::new(),
+            dflash: false,
+            dflash_spec_supported: false,
+            dflash_draft_path: String::new(),
+            dflash_n_max: 0,
         }
     }
 
@@ -1657,5 +1728,144 @@ mod tests {
 
         assert_no_flag(&args, "--model-draft");
         assert_no_flag(&args, "--spec-type");
+    }
+
+    #[test]
+    fn test_dflash_off_no_spec_flags() {
+        let mut config = default_config();
+        config.version_backend = "b9937/standard".to_string();
+        config.dflash = false;
+        config.dflash_draft_path = "/path/to/dflash-draft.gguf".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("qwen3.6-27b", "/path", 8080, None);
+
+        assert_no_flag(&args, "--model-draft");
+        assert_no_flag(&args, "--spec-type");
+        assert_no_flag(&args, "--spec-draft-n-max");
+    }
+
+    #[test]
+    fn test_dflash_on_skips_unsupported_upstream_spec_type() {
+        let mut config = default_config();
+        config.version_backend = "b9937/standard".to_string();
+        config.dflash = true;
+        config.dflash_draft_path = "/path/to/dflash-draft.gguf".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("qwen3.6-27b", "/path", 8080, None);
+
+        assert_no_flag(&args, "--model-draft");
+        assert_no_flag(&args, "--spec-type");
+        assert_no_flag(&args, "--spec-draft-n-max");
+    }
+
+    #[test]
+    fn test_dflash_on_emits_spec_flags_when_probe_supports_it() {
+        let mut config = default_config();
+        config.version_backend = "b9937/standard".to_string();
+        config.dflash = true;
+        config.dflash_spec_supported = true;
+        config.dflash_draft_path = "/path/to/dflash-draft.gguf".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("qwen3.6-27b", "/path", 8080, None);
+
+        assert_arg_pair(&args, "--model-draft", "/path/to/dflash-draft.gguf");
+        assert_arg_pair(&args, "--spec-type", "draft-dflash");
+        assert_arg_pair(&args, "--spec-draft-n-max", "15");
+    }
+
+    #[test]
+    fn test_dflash_custom_n_max_skipped_with_unsupported_upstream_spec_type() {
+        let mut config = default_config();
+        config.version_backend = "b9937/standard".to_string();
+        config.dflash = true;
+        config.dflash_draft_path = "/path/to/dflash-draft.gguf".to_string();
+        config.dflash_n_max = 7;
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("qwen3.6-27b", "/path", 8080, None);
+
+        assert_no_flag(&args, "--model-draft");
+        assert_no_flag(&args, "--spec-type");
+        assert_no_flag(&args, "--spec-draft-n-max");
+    }
+
+    #[test]
+    fn test_dflash_custom_n_max_emits_when_probe_supports_it() {
+        let mut config = default_config();
+        config.version_backend = "b9937/standard".to_string();
+        config.dflash = true;
+        config.dflash_spec_supported = true;
+        config.dflash_draft_path = "/path/to/dflash-draft.gguf".to_string();
+        config.dflash_n_max = 7;
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("qwen3.6-27b", "/path", 8080, None);
+
+        assert_arg_pair(&args, "--spec-draft-n-max", "7");
+    }
+
+    #[test]
+    fn test_dflash_skipped_on_all_upstream_builds() {
+        let mut config = default_config();
+        config.version_backend = "b9830/standard".to_string();
+        config.dflash = true;
+        config.dflash_draft_path = "/path/to/dflash-draft.gguf".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("qwen3.6-27b", "/path", 8080, None);
+
+        assert_no_flag(&args, "--model-draft");
+        assert_no_flag(&args, "--spec-type");
+        assert_no_flag(&args, "--spec-draft-n-max");
+    }
+
+    #[test]
+    fn test_dflash_skipped_without_draft_path() {
+        let mut config = default_config();
+        config.version_backend = "b9937/standard".to_string();
+        config.dflash = true;
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("qwen3.6-27b", "/path", 8080, None);
+
+        assert_no_flag(&args, "--model-draft");
+        assert_no_flag(&args, "--spec-type");
+        assert_no_flag(&args, "--spec-draft-n-max");
+    }
+
+    #[test]
+    fn test_dflash_skipped_in_embedding_mode() {
+        let mut config = default_config();
+        config.version_backend = "b9937/standard".to_string();
+        config.dflash = true;
+        config.dflash_draft_path = "/path/to/dflash-draft.gguf".to_string();
+
+        let builder = ArgumentBuilder::new(config, true).unwrap();
+        let args = builder.build("qwen3.6-27b", "/path", 8080, None);
+
+        assert_no_flag(&args, "--model-draft");
+        assert_no_flag(&args, "--spec-type");
+    }
+
+    #[test]
+    fn test_dflash_takes_precedence_over_mtp() {
+        // Defense-in-depth: when both toggles are somehow enabled and the
+        // backend supports DFlash, emit only the DFlash speculative path.
+        let mut config = default_config();
+        config.version_backend = "b9937/standard".to_string();
+        config.mtp = true;
+        config.dflash = true;
+        config.dflash_spec_supported = true;
+        config.dflash_draft_path = "/path/to/dflash-draft.gguf".to_string();
+
+        let builder = ArgumentBuilder::new(config, false).unwrap();
+        let args = builder.build("qwen3.6-27b", "/path", 8080, None);
+
+        assert_arg_pair(&args, "--model-draft", "/path/to/dflash-draft.gguf");
+        assert_arg_pair(&args, "--spec-type", "draft-dflash");
+        assert_arg_pair(&args, "--spec-draft-n-max", "15");
     }
 }

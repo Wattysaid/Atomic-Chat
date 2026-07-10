@@ -20,6 +20,27 @@
     }
   },
   {
+    "key": "dflash",
+    "title": "Enable DFlash (multi-layer draft speculative decoding)",
+    "description": "Speculative decoding via a separate multi-layer DFlash draft GGUF. When enabled, Atomic Chat lets you choose the draft quantization before downloading it. Atomic Chat probes the selected llama-server binary before load and only passes --spec-type draft-dflash when that backend advertises support. Supported targets: Qwen3.5-9B ([onion515/Qwen3.5-9B-DFlash-GGUF](https://huggingface.co/onion515/Qwen3.5-9B-DFlash-GGUF)), Qwen3.6-27B ([williamliao/qwen3.6-27B-DFlash-GGUF](https://huggingface.co/williamliao/qwen3.6-27B-DFlash-GGUF)), Qwen3.6-35B-A3B ([williamliao/Qwen3.6-35B-A3B-DFlash-GGUF](https://huggingface.co/williamliao/Qwen3.6-35B-A3B-DFlash-GGUF)). Mutually exclusive with MTP.",
+    "controllerType": "checkbox",
+    "controllerProps": {
+      "value": false
+    }
+  },
+  {
+    "key": "dflash_block_size",
+    "title": "DFlash Block Size",
+    "description": "Draft block size for DFlash. The number of speculative tokens per step (--spec-draft-n-max) is derived as block_size - 1. Default 16.",
+    "controllerType": "input",
+    "controllerProps": {
+      "value": 16,
+      "placeholder": "16",
+      "type": "number",
+      "textAlign": "right"
+    }
+  },
+  {
     "key": "concurrent_mode",
     "title": "Concurrent Mode",
     "description": "Run the model as a multi-slot server: serves multiple chat requests in parallel on one loaded model. Overrides Parallel Sequences and Continuous Batching and exposes Prometheus /metrics.",

@@ -29,6 +29,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::load_llama_model,
             commands::unload_llama_model,
             commands::get_devices,
+            commands::check_spec_type_support,
             commands::generate_api_key,
             commands::is_process_running,
             commands::get_random_port,

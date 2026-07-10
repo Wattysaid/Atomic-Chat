@@ -65,6 +65,13 @@ import {
   type GemmaMtpDraft,
 } from './gemmaMtpRegistry'
 import {
+  resolveDflashDraft,
+  listDflashDrafts,
+  checkDflashSupport,
+  dflashDraftUrl,
+  type DflashDraft,
+} from './dflashRegistry'
+import {
   resolveLlama3TemplateOverride,
   STRICT_SYSTEM_GUARD_SIGNATURE,
 } from './chatTemplateOverrides'
@@ -93,6 +100,7 @@ import {
   getSupportedFeaturesFromRust,
   normalizeFeatures,
   isCudaInstalledFromRust,
+  checkSpecTypeSupport,
 } from '../../../src-tauri/plugins/tauri-plugin-llamacpp-upstream/guest-js/index'
 
 // Error message constant - matches web-app/src/utils/error.ts
@@ -135,6 +143,7 @@ const AUTO_INCREASE_CTX_AT_MAX = 'local_backend://auto_increase_ctx_at_max'
 /// llama.cpp/libmtmd build cannot parse (e.g. Gemma 4 `gemma4a` audio).
 /// On this error we retry the load text-only (without --mmproj).
 const ERR_MULTIMODAL_PROJECTOR_LOAD_FAILED = 'MULTIMODAL_PROJECTOR_LOAD_FAILED'
+const DFLASH_SPEC_TYPE = 'draft-dflash'
 /// ATO-187: the model / mmproj GGUF is missing on disk (an interrupted
 /// download that never produced the final file, a file removed outside the
 /// app, or a stale path). Matches the Rust `ModelFileNotFound` code; the
@@ -183,7 +192,7 @@ function modelLoadReadyTimeoutSecs(configuredTimeoutSecs: number): number {
 /// (`LLAMACPP_UPSTREAM_TAG`) and `atomic-chat-conf/backends/manifest.json`
 /// (`tag_name`). Remove (or move to a real settings-driven pin) once the
 /// team is done validating this tag broadly. See `enforcePinnedBackendVersion`.
-const PINNED_BACKEND_TAG = 'b9893'
+const PINNED_BACKEND_TAG = 'b9937'
 
 /**
  * Override the default app.log function to use Jan's logging system.
@@ -2341,6 +2350,16 @@ export default class llamacpp_upstream_extension extends AIEngine {
         : undefined
     this.config[key] = value
 
+    // Mutual exclusivity between DFlash and MTP speculative-decoding modes.
+    // The UI (`$providerName.tsx`) owns persistence of both keys via
+    // writeSetting; this keeps the in-memory config consistent as
+    // defense-in-depth so a stale sibling flag can't survive into performLoad.
+    if (key === 'dflash' && value) {
+      this.config.mtp = false
+    } else if (key === 'mtp' && value) {
+      this.config.dflash = false
+    }
+
     if (key === 'version_backend') {
       const valueStr = value as string
       // Async logic wrapped in IIFE since onSettingUpdate is void
@@ -3398,6 +3417,145 @@ export default class llamacpp_upstream_extension extends AIEngine {
   }
 
   /**
+   * Whether the given model id is a DFlash-capable target (Qwen3.5-9B,
+   * Qwen3.6-27B, Qwen3.6-35B-A3B). Used by the provider settings UI to decide
+   * between the download path and the unsupported dialog.
+   */
+  async checkDflashSupport(modelId: string): Promise<boolean> {
+    return checkDflashSupport(modelId)
+  }
+
+  /** Available compatible draft quantizations for the selected target model. */
+  async listDflashDrafts(modelId: string): Promise<DflashDraft[]> {
+    return listDflashDrafts(modelId)
+  }
+
+  /**
+   * Whether the selected backend binary can accept
+   * `--spec-type draft-dflash`. This is separate from model-level support so
+   * the UI can explain backend limitations before downloading a draft.
+   */
+  async checkDflashBackendSupport(): Promise<boolean> {
+    const [version, backend] = stripBom(this.config.version_backend || '').split('/')
+    if (!version || !backend || version === 'latest') return false
+    try {
+      const backendPath = await getBackendExePath(backend, version)
+      return await this.backendSupportsDflashSpec(backendPath, {})
+    } catch (e) {
+      logger.warn(
+        `Failed to probe DFlash backend support for ${this.config.version_backend}:`,
+        e
+      )
+      return false
+    }
+  }
+
+  private async backendSupportsDflashSpec(
+    backendPath: string,
+    envs: Record<string, string>
+  ): Promise<boolean> {
+    try {
+      return await checkSpecTypeSupport(backendPath, DFLASH_SPEC_TYPE, envs)
+    } catch (e) {
+      logger.warn(
+        `Failed to probe llama-server support for ${DFLASH_SPEC_TYPE}:`,
+        e
+      )
+      return false
+    }
+  }
+
+  /**
+   * Ensure the DFlash draft GGUF is present next to the target model and
+   * recorded in its `model.yml` (`dflash_draft_path`). Mirrors
+   * `ensureGemmaMtpDraft`: idempotent — if the draft is already on disk and
+   * referenced in `model.yml`, it is a no-op.
+   *
+   * @param modelId A DFlash-capable target model id.
+   * @param quant Draft quantization selected by the user. Defaults to Q4_K_M.
+   * @throws if the model id is not a DFlash target.
+   */
+  async ensureDflashDraft(modelId: string, quant?: string): Promise<void> {
+    const draft: DflashDraft | null = resolveDflashDraft(modelId, quant)
+    if (!draft) {
+      throw new Error(
+        `Model "${modelId}" does not have a compatible DFlash draft${quant ? ` quantization "${quant}"` : ''}.`
+      )
+    }
+
+    const janDataFolderPath = await getJanDataFolderPath()
+    const modelsRoot = await this.getModelsRootPath()
+    const configPath = await joinPath([modelsRoot, modelId, 'model.yml'])
+    if (!(await fs.existsSync(configPath))) {
+      throw new Error(`Model ${modelId} is not installed`)
+    }
+
+    // Path relative to Jan's data folder (kept relative in model.yml, matching
+    // how `model_path` / `mmproj_path` are stored).
+    const draftSuffix =
+      draft.quant === 'Q4_K_M' ? '' : `-${draft.quant.toLowerCase()}`
+    const relativeDraftPath = `${MODELS_PROVIDER_ROOT}/models/${modelId}/dflash-draft${draftSuffix}.gguf`
+    const absoluteDraftPath = await joinPath([
+      janDataFolderPath,
+      relativeDraftPath,
+    ])
+
+    const modelConfig = await invoke<ModelConfig>('read_yaml', {
+      path: configPath,
+    })
+
+    // Already downloaded + referenced → nothing to do.
+    if (
+      modelConfig.dflash_draft_path === relativeDraftPath &&
+      (await fs.existsSync(absoluteDraftPath))
+    ) {
+      return
+    }
+
+    if (!(await fs.existsSync(absoluteDraftPath))) {
+      const downloadItem: DownloadItem = {
+        url: dflashDraftUrl(draft),
+        save_path: relativeDraftPath,
+        proxy: getProxyConfig(),
+        sha256: draft.draftSha256,
+        size: draft.draftSize,
+        model_id: modelId,
+      }
+      const onProgress = (transferred: number, total: number) => {
+        events.emit(DownloadEvent.onFileDownloadUpdate, {
+          modelId,
+          percent: total > 0 ? transferred / total : 0,
+          size: { transferred, total },
+          downloadType: 'Model',
+        })
+      }
+      const downloadManager = window.core.extensionManager.getByName(
+        '@janhq/download-extension'
+      )
+      await downloadManager.downloadFiles(
+        [downloadItem],
+        this.createDownloadTaskId(`${modelId}-dflash-draft`),
+        onProgress,
+        false
+      )
+      events.emit(DownloadEvent.onFileDownloadAndVerificationSuccess, {
+        modelId,
+        downloadType: 'Model',
+      })
+    }
+
+    // Record the draft in model.yml so `performLoad` can resolve it.
+    const updatedConfig = {
+      ...modelConfig,
+      dflash_draft_path: relativeDraftPath,
+    } as ModelConfig
+    await invoke<void>('write_yaml', {
+      data: updatedConfig,
+      savePath: configPath,
+    })
+  }
+
+  /**
    * Deletes the entire model folder for a given modelId
    * @param modelId The model ID to delete
    */
@@ -3883,6 +4041,91 @@ export default class llamacpp_upstream_extension extends AIEngine {
       }
     }
 
+    const backendPath = await getBackendExePath(backend, version)
+
+    // DFlash support is a property of the installed binary, not just the tag:
+    // probe `llama-server -h` so official builds that do not advertise
+    // draft-dflash stay safe, while compatible builds can use the draft.
+    cfg.dflash_spec_supported = cfg.dflash
+      ? await this.backendSupportsDflashSpec(backendPath, envs)
+      : false
+    if (cfg.dflash && !cfg.dflash_spec_supported) {
+      logger.warn(
+        `DFlash is enabled but this Llama.cpp backend does not support draft-dflash; loading "${modelId}" without DFlash.`
+      )
+      cfg.dflash = false
+    }
+
+    // DFlash: like Gemma 4 MTP, the draft is a separate GGUF keyed to the
+    // loaded target, so resolve it lazily here. If DFlash is enabled, this
+    // model is a DFlash-capable target, and the draft has not been
+    // downloaded/recorded yet (e.g. the user toggled DFlash on with no
+    // supported model active), fetch it now before building args.
+    if (
+      cfg.dflash &&
+      !modelConfig.dflash_draft_path &&
+      checkDflashSupport(modelId)
+    ) {
+      try {
+        await this.ensureDflashDraft(modelId)
+        const refreshed = await invoke<ModelConfig>('read_yaml', {
+          path: modelConfigPath,
+        })
+        modelConfig.dflash_draft_path = refreshed.dflash_draft_path
+      } catch (e) {
+        logger.warn(
+          `Failed to ensure DFlash draft for ${modelId}; loading without DFlash:`,
+          e
+        )
+      }
+    }
+
+    // Resolve the draft to an absolute path so the Rust arg builder can emit
+    // `--model-draft <path> --spec-type draft-dflash`.
+    if (cfg.dflash && modelConfig.dflash_draft_path) {
+      cfg.dflash_draft_path = await joinPath([
+        janDataFolderPath,
+        modelConfig.dflash_draft_path,
+      ])
+    } else {
+      cfg.dflash_draft_path = ''
+    }
+
+    // DFlash capability gate (mirrors the MTP gate). `dflash` is a
+    // provider-global toggle, so it stays on when switching models. Passing a
+    // model with no resolvable DFlash draft would make llama-server fail the
+    // load, so silently load without DFlash (warn only) instead of crashing.
+    if (cfg.dflash && cfg.dflash_draft_path.length === 0) {
+      logger.warn(
+        `DFlash is enabled but model "${modelId}" has no resolvable draft; loading without DFlash.`
+      )
+      cfg.dflash = false
+    }
+
+    // Compute --spec-draft-n-max from the user's DFlash block-size setting
+    // (n_max = block_size - 1). 0 tells the Rust builder to use its default.
+    if (cfg.dflash) {
+      const blockSize = Number(
+        (cfg as Record<string, unknown>).dflash_block_size
+      )
+      cfg.dflash_n_max =
+        Number.isFinite(blockSize) && blockSize > 1
+          ? Math.max(Math.floor(blockSize) - 1, 1)
+          : 0
+    } else {
+      cfg.dflash_n_max = 0
+    }
+
+    // Mutual exclusivity (defense-in-depth; the UI mutex should prevent this):
+    // if both MTP and DFlash survived their gates, prefer DFlash and drop MTP.
+    if (cfg.dflash && cfg.mtp) {
+      logger.warn(
+        `Both MTP and DFlash are enabled for "${modelId}"; applying DFlash only.`
+      )
+      cfg.mtp = false
+      cfg.mtp_draft_path = ''
+    }
+
     if (!this.modelMaxCtxTrain.has(modelId)) {
       const max = await this.resolveModelMaxCtxTrain(modelPath)
       if (typeof max === 'number') {
@@ -3897,7 +4140,6 @@ export default class llamacpp_upstream_extension extends AIEngine {
       'Calling Tauri command load_llama_model with config:',
       JSON.stringify(cfg)
     )
-    const backendPath = await getBackendExePath(backend, version)
 
     try {
       const sInfo = await loadLlamaModel(

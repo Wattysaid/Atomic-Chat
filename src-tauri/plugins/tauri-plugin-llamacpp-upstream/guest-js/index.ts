@@ -66,6 +66,10 @@ export function normalizeLlamacppConfig(config: any): LlamacppConfig {
     cont_batching: asBool(config.cont_batching),
     mtp: asBool(config.mtp),
     mtp_draft_path: asString(config.mtp_draft_path),
+    dflash: asBool(config.dflash),
+    dflash_spec_supported: asBool(config.dflash_spec_supported),
+    dflash_draft_path: asString(config.dflash_draft_path),
+    dflash_n_max: asNumber(config.dflash_n_max),
 
     no_mmap: asBool(config.no_mmap),
     mlock: asBool(config.mlock),
@@ -126,6 +130,18 @@ export async function getDevices(
   return await invoke('plugin:llamacpp-upstream|get_devices', {
     backendPath,
     libraryPath,
+  })
+}
+
+export async function checkSpecTypeSupport(
+  backendPath: string,
+  specType: string,
+  envs: Record<string, string>
+): Promise<boolean> {
+  return await invoke('plugin:llamacpp-upstream|check_spec_type_support', {
+    backendPath,
+    specType,
+    envs,
   })
 }
 

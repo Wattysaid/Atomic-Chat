@@ -17,7 +17,10 @@ import {
 } from '@tanstack/react-router'
 import { useTranslation } from '@/i18n/react-i18next-compat'
 import Capabilities from '@/containers/Capabilities'
-import { ModelSourceBadge, MissingModelBadge } from '@/components/ModelSourceBadge'
+import {
+  ModelSourceBadge,
+  MissingModelBadge,
+} from '@/components/ModelSourceBadge'
 import { DynamicControllerSetting } from '@/containers/dynamicControllerSetting'
 import { RenderMarkdown } from '@/containers/RenderMarkdown'
 import { DialogEditModel } from '@/containers/dialogs/EditModel'
@@ -27,6 +30,11 @@ import { DflashUnsupportedDialog } from '@/containers/dialogs/DflashUnsupportedD
 import { MtpUnsupportedDialog } from '@/containers/dialogs/MtpUnsupportedDialog'
 import { Eagle3UnsupportedDialog } from '@/containers/dialogs/Eagle3UnsupportedDialog'
 import { LlamacppMtpUnsupportedDialog } from '@/containers/dialogs/LlamacppMtpUnsupportedDialog'
+import { LlamacppDflashUnsupportedDialog } from '@/containers/dialogs/LlamacppDflashUnsupportedDialog'
+import {
+  LlamacppDflashDraftDialog,
+  type LlamacppDflashDraftOption,
+} from '@/containers/dialogs/LlamacppDflashDraftDialog'
 import { ModelSetting } from '@/containers/ModelSetting'
 import { DialogDeleteModel } from '@/containers/dialogs/DeleteModel'
 import { FavoriteModelAction } from '@/containers/FavoriteModelAction'
@@ -192,6 +200,15 @@ function ProviderDetail() {
   const [isTogglingLlamacppMtp, setIsTogglingLlamacppMtp] = useState(false)
   const [llamacppMtpUnsupportedModel, setLlamacppMtpUnsupportedModel] =
     useState<string | null>(null)
+  const [isTogglingLlamacppDflash, setIsTogglingLlamacppDflash] =
+    useState(false)
+  const [llamacppDflashUnsupportedModel, setLlamacppDflashUnsupportedModel] =
+    useState<string | null>(null)
+  const [llamacppDflashDraftSelection, setLlamacppDflashDraftSelection] =
+    useState<{
+      modelId: string
+      options: LlamacppDflashDraftOption[]
+    } | null>(null)
   const { providerName } = useParams({ from: Route.id })
   /// The turboquant provider (`llamacpp`) ships alongside upstream on
   /// Windows/Linux. Each owns its own backend tree + localStorage keys, so
@@ -1012,9 +1029,8 @@ function ProviderDetail() {
         return
       }
 
-      const blockSizeRaw = provider.settings.find(
-        (s) => s.key === 'block_size'
-      )?.controller_props?.value
+      const blockSizeRaw = provider.settings.find((s) => s.key === 'block_size')
+        ?.controller_props?.value
       const blockSize = Number(blockSizeRaw) || 16
 
       setLoadingModels((prev) =>
@@ -1052,7 +1068,10 @@ function ProviderDetail() {
             s.key === 'dflash_enabled'
               ? {
                   ...s,
-                  controller_props: { ...s.controller_props, value: true as never },
+                  controller_props: {
+                    ...s.controller_props,
+                    value: true as never,
+                  },
                 }
               : s.key === 'mtp_enabled' || s.key === 'eagle3_enabled'
                 ? {
@@ -1067,7 +1086,9 @@ function ProviderDetail() {
           serviceHub.providers().updateSettings(providerName, next)
           updateProvider(providerName, { ...provider, settings: next })
           toast.success(
-            t('settings:dflashEnableSuccess', { defaultValue: 'DFlash enabled' })
+            t('settings:dflashEnableSuccess', {
+              defaultValue: 'DFlash enabled',
+            })
           )
         }
       } catch (error) {
@@ -1536,6 +1557,148 @@ function ProviderDetail() {
     ]
   )
 
+  const handleToggleLlamacppDflash = useCallback(
+    async (nextEnabled: boolean, draftQuant?: string) => {
+      if (provider?.provider !== 'llamacpp-upstream' || !provider) return
+      if (isTogglingLlamacppDflash) return
+
+      const writeSettings = (updates: Record<string, unknown>) => {
+        const next = provider.settings.map((s) =>
+          Object.prototype.hasOwnProperty.call(updates, s.key)
+            ? {
+                ...s,
+                controller_props: {
+                  ...s.controller_props,
+                  value: updates[s.key] as never,
+                },
+              }
+            : s
+        )
+        serviceHub.providers().updateSettings(providerName, next)
+        updateProvider(providerName, { ...provider, settings: next })
+      }
+
+      const errTitle = t('settings:llamacppDflashToggleFailed', {
+        defaultValue: 'Failed to toggle DFlash',
+      })
+
+      const engine: any = EngineManager.instance().get('llamacpp-upstream')
+      if (!engine) {
+        toast.error(errTitle, {
+          description: t('settings:llamacppDflashEngineMissing', {
+            defaultValue: 'Llama.cpp engine is unavailable.',
+          }),
+        })
+        return
+      }
+
+      const loadedModels: string[] = (await engine.getLoadedModels?.()) ?? []
+      const activeModel = loadedModels[0]
+
+      setIsTogglingLlamacppDflash(true)
+      try {
+        if (nextEnabled) {
+          const backendSupportsDflash =
+            (await engine.checkDflashBackendSupport?.()) ?? false
+          if (!backendSupportsDflash) {
+            toast.error(errTitle, {
+              description: t('settings:llamacppDflashBackendUnsupported', {
+                defaultValue:
+                  'The selected Llama.cpp backend does not advertise DFlash support (--spec-type draft-dflash). Update or switch to a compatible backend before enabling DFlash.',
+              }),
+            })
+            return
+          }
+
+          if (!activeModel) {
+            toast.error(errTitle, {
+              description: t('settings:llamacppDflashNoActiveModel', {
+                defaultValue: 'Start a Llama.cpp model before enabling DFlash.',
+              }),
+            })
+            return
+          }
+
+          const isSupported =
+            (await engine.checkDflashSupport?.(activeModel)) ?? false
+          if (!isSupported) {
+            setLlamacppDflashUnsupportedModel(activeModel)
+            return
+          }
+
+          if (!draftQuant) {
+            const options: LlamacppDflashDraftOption[] =
+              (await engine.listDflashDrafts?.(activeModel)) ?? []
+            if (options.length === 0) {
+              throw new Error(
+                `No compatible DFlash draft quantizations found for "${activeModel}".`
+              )
+            }
+            setLlamacppDflashDraftSelection({
+              modelId: activeModel,
+              options,
+            })
+            return
+          }
+
+          toast.info(
+            t('settings:llamacppDflashDownloadingDraft', {
+              defaultValue: 'Downloading {{quant}} DFlash draft model…',
+              quant: draftQuant,
+            })
+          )
+          await engine.ensureDflashDraft?.(activeModel, draftQuant)
+          writeSettings({ dflash: true, mtp: false })
+        } else {
+          writeSettings({ dflash: false })
+        }
+
+        if (activeModel) {
+          try {
+            await engine.unload?.(activeModel)
+          } catch (e) {
+            console.warn('Failed to unload before DFlash restart:', e)
+          }
+          try {
+            await engine.load?.(activeModel)
+          } catch (e) {
+            console.error('Failed to reload after DFlash toggle:', e)
+            toast.error(errTitle, {
+              description:
+                e instanceof Error ? e.message : 'Failed to restart model.',
+            })
+            return
+          }
+        }
+
+        toast.success(
+          nextEnabled
+            ? t('settings:llamacppDflashEnableSuccess', {
+                defaultValue: 'DFlash enabled',
+              })
+            : t('settings:llamacppDflashDisableSuccess', {
+                defaultValue: 'DFlash disabled',
+              })
+        )
+      } catch (error) {
+        console.error('Failed to toggle Llamacpp DFlash:', error)
+        toast.error(errTitle, {
+          description: error instanceof Error ? error.message : 'Unknown error',
+        })
+      } finally {
+        setIsTogglingLlamacppDflash(false)
+      }
+    },
+    [
+      provider,
+      providerName,
+      serviceHub,
+      updateProvider,
+      t,
+      isTogglingLlamacppDflash,
+    ]
+  )
+
   const handleInstallBackendFromFile = useCallback(async () => {
     // On Windows/Linux the local llama.cpp provider id is `llamacpp-upstream`
     // (`LOCAL_LLAMACPP_PROVIDER`), not `llamacpp`. The button is rendered for
@@ -1740,8 +1903,9 @@ function ProviderDetail() {
                   // block-size row when its master switch is off so the
                   // panel stays uncluttered.
                   const dflashEnabledOn = !!(
-                    provider?.settings.find((s) => s.key === 'dflash_enabled')
-                      ?.controller_props as { value?: boolean } | undefined
+                    provider?.settings.find(
+                      (s) => s.key === 'dflash_enabled' || s.key === 'dflash'
+                    )?.controller_props as { value?: boolean } | undefined
                   )?.value
                   const mtpEnabledOn = !!(
                     provider?.settings.find((s) => s.key === 'mtp_enabled')
@@ -1753,6 +1917,7 @@ function ProviderDetail() {
                   )?.value
                   const isHiddenByDflash =
                     (!dflashEnabledOn && setting.key === 'block_size') ||
+                    (!dflashEnabledOn && setting.key === 'dflash_block_size') ||
                     (!mtpEnabledOn && setting.key === 'mtp_block_size') ||
                     (!eagle3EnabledOn && setting.key === 'eagle3_block_size')
 
@@ -1771,6 +1936,9 @@ function ProviderDetail() {
                   /// defence-in-depth.
                   const isLlamacppMtpToggle =
                     setting.key === 'mtp' &&
+                    provider?.provider === 'llamacpp-upstream'
+                  const isLlamacppDflashToggle =
+                    setting.key === 'dflash' &&
                     provider?.provider === 'llamacpp-upstream'
 
                   // Use the DynamicController component
@@ -1877,6 +2045,30 @@ function ProviderDetail() {
                             />
                           )}
                         </div>
+                      ) : isLlamacppDflashToggle ? (
+                        <div className="flex items-center gap-2">
+                          <Switch
+                            checked={
+                              !!(
+                                setting.controller_props as {
+                                  value?: boolean
+                                }
+                              ).value
+                            }
+                            disabled={
+                              isTogglingLlamacppDflash || isTogglingLlamacppMtp
+                            }
+                            onCheckedChange={(checked) => {
+                              handleToggleLlamacppDflash(checked)
+                            }}
+                          />
+                          {isTogglingLlamacppDflash && (
+                            <IconLoader
+                              size={14}
+                              className="animate-spin text-muted-foreground"
+                            />
+                          )}
+                        </div>
                       ) : isLlamacppMtpToggle ? (
                         <div className="flex items-center gap-2">
                           <Switch
@@ -1887,7 +2079,9 @@ function ProviderDetail() {
                                 }
                               ).value
                             }
-                            disabled={isTogglingLlamacppMtp}
+                            disabled={
+                              isTogglingLlamacppMtp || isTogglingLlamacppDflash
+                            }
                             onCheckedChange={(checked) => {
                               handleToggleLlamacppMtp(checked)
                             }}
@@ -1990,7 +2184,8 @@ function ProviderDetail() {
                                 // setting value too, not just the mirror field.
                                 const trimmedUrl = newValue.trim()
                                 ;(
-                                  newSettings[settingIndex].controller_props as {
+                                  newSettings[settingIndex]
+                                    .controller_props as {
                                     value: string | boolean | number
                                   }
                                 ).value = trimmedUrl
@@ -2313,24 +2508,24 @@ function ProviderDetail() {
                       {provider &&
                         (provider.provider === 'llamacpp' ||
                           provider.provider === 'llamacpp-upstream') && (
-                        <ImportVisionModelDialog
-                          provider={provider}
-                          onSuccess={handleModelImportSuccess}
-                          trigger={
-                            <Button
-                              variant="secondary"
-                              size="sm"
-                              className="min-w-[8rem] justify-center"
-                            >
-                              <IconFolderPlus
-                                size={18}
-                                className="text-muted-foreground"
-                              />
-                              <span>{t('providers:import')}</span>
-                            </Button>
-                          }
-                        />
-                      )}
+                          <ImportVisionModelDialog
+                            provider={provider}
+                            onSuccess={handleModelImportSuccess}
+                            trigger={
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                className="min-w-[8rem] justify-center"
+                              >
+                                <IconFolderPlus
+                                  size={18}
+                                  className="text-muted-foreground"
+                                />
+                                <span>{t('providers:import')}</span>
+                              </Button>
+                            }
+                          />
+                        )}
                       {provider && provider.provider === 'mlx' && (
                         <ImportMlxModelDialog
                           provider={provider}
@@ -2567,6 +2762,24 @@ function ProviderDetail() {
           if (!open) setLlamacppMtpUnsupportedModel(null)
         }}
         modelId={llamacppMtpUnsupportedModel ?? ''}
+      />
+      <LlamacppDflashUnsupportedDialog
+        open={llamacppDflashUnsupportedModel !== null}
+        onOpenChange={(open) => {
+          if (!open) setLlamacppDflashUnsupportedModel(null)
+        }}
+        modelId={llamacppDflashUnsupportedModel ?? ''}
+      />
+      <LlamacppDflashDraftDialog
+        open={llamacppDflashDraftSelection !== null}
+        onOpenChange={(open) => {
+          if (!open) setLlamacppDflashDraftSelection(null)
+        }}
+        modelId={llamacppDflashDraftSelection?.modelId ?? ''}
+        options={llamacppDflashDraftSelection?.options ?? []}
+        onConfirm={(quant) => {
+          void handleToggleLlamacppDflash(true, quant)
+        }}
       />
     </div>
   )

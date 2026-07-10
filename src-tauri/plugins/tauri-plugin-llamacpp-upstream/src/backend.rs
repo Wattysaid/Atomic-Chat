@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use tauri::{Manager, Runtime};
 
 #[tauri::command]
@@ -234,6 +235,57 @@ fn is_backend_installed(backend_dir: &PathBuf) -> bool {
     // Otherwise check root directory (llama-server)
     let root_path = backend_dir.join(exe_name);
     root_path.exists()
+}
+
+fn backend_executable_path(backend_dir: &PathBuf) -> PathBuf {
+    let exe_name = if cfg!(target_os = "windows") {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    let build_path = backend_dir.join("build").join("bin").join(exe_name);
+    if build_path.exists() {
+        build_path
+    } else {
+        backend_dir.join(exe_name)
+    }
+}
+
+fn parse_binary_version(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("version:")
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+    })
+}
+
+fn backend_binary_matches_version(backend_dir: &PathBuf, expected_version: &str) -> bool {
+    let expected = parse_backend_version(expected_version.to_string());
+    if expected == 0 {
+        return true;
+    }
+
+    let output = match Command::new(backend_executable_path(backend_dir))
+        .arg("--version")
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            log::warn!(
+                "Failed to inspect bundled backend version for {}: {}",
+                backend_dir.display(),
+                error
+            );
+            return false;
+        }
+    };
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_binary_version(&combined) == Some(expected)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1151,19 +1203,38 @@ pub async fn install_bundled_backend<R: Runtime>(
         return not_bundled;
     }
 
+    if !backend_binary_matches_version(&resource_dir, &version) {
+        log::warn!(
+            "[install_bundled_backend] Bundled binary does not match declared version {}; refusing mislabeled resource",
+            version
+        );
+        return not_bundled;
+    }
+
     let target_dir = PathBuf::from(&backends_dir).join(&version).join(&backend);
 
     if is_backend_installed(&target_dir) {
-        log::info!(
-            "[install_bundled_backend] Bundled backend already installed: {}/{}",
-            version, backend
+        if backend_binary_matches_version(&target_dir, &version) {
+            log::info!(
+                "[install_bundled_backend] Bundled backend already installed: {}/{}",
+                version, backend
+            );
+            return Ok(BundledBackendResult {
+                installed: true,
+                backend_string: Some(format!("{}/{}", version, backend)),
+                version: Some(version),
+                backend: Some(backend),
+            });
+        }
+
+        log::warn!(
+            "[install_bundled_backend] Replacing mislabeled backend at {} with bundled {}/{}",
+            target_dir.display(),
+            version,
+            backend
         );
-        return Ok(BundledBackendResult {
-            installed: true,
-            backend_string: Some(format!("{}/{}", version, backend)),
-            version: Some(version),
-            backend: Some(backend),
-        });
+        fs::remove_dir_all(&target_dir)
+            .map_err(|e| format!("remove stale backend {}: {}", target_dir.display(), e))?;
     }
 
     log::info!(
@@ -1768,6 +1839,20 @@ mod tests {
         // Note: "v1.0.0" would fail to parse as u32 due to dots, returning 0
         assert_eq!(parse_backend_version("v1.0.0".to_string()), 0);
     }
+
+    #[test]
+    fn test_parse_binary_version() {
+        assert_eq!(
+            parse_binary_version("version: 9937 (2021515a1)\nbuilt with AppleClang"),
+            Some(9937)
+        );
+        assert_eq!(
+            parse_binary_version("warning\nversion: 9222 (9a532ae4b)\n"),
+            Some(9222)
+        );
+        assert_eq!(parse_binary_version("unknown version"), None);
+    }
+
     // --- Filesystem Integration Tests ---
 
     #[tokio::test]

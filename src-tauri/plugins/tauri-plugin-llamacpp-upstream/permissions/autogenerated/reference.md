@@ -8,6 +8,7 @@ Default permissions for the llamacpp plugin
 - `allow-load-llama-model`
 - `allow-unload-llama-model`
 - `allow-get-devices`
+- `allow-check-spec-type-support`
 - `allow-generate-api-key`
 - `allow-is-process-running`
 - `allow-get-random-port`
@@ -68,6 +69,32 @@ Enables the check_backend_for_updates command without any pre-configured scope.
 <td>
 
 Denies the check_backend_for_updates command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`llamacpp-upstream:allow-check-spec-type-support`
+
+</td>
+<td>
+
+Enables the check_spec_type_support command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`llamacpp-upstream:deny-check-spec-type-support`
+
+</td>
+<td>
+
+Denies the check_spec_type_support command without any pre-configured scope.
 
 </td>
 </tr>
