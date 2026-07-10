@@ -1562,7 +1562,7 @@ function ProviderDetail() {
       if (provider?.provider !== 'llamacpp-upstream' || !provider) return
       if (isTogglingLlamacppDflash) return
 
-      const writeSettings = (updates: Record<string, unknown>) => {
+      const writeSettings = async (updates: Record<string, unknown>) => {
         const next = provider.settings.map((s) =>
           Object.prototype.hasOwnProperty.call(updates, s.key)
             ? {
@@ -1574,7 +1574,7 @@ function ProviderDetail() {
               }
             : s
         )
-        serviceHub.providers().updateSettings(providerName, next)
+        await serviceHub.providers().updateSettings(providerName, next)
         updateProvider(providerName, { ...provider, settings: next })
       }
 
@@ -1648,9 +1648,9 @@ function ProviderDetail() {
             })
           )
           await engine.ensureDflashDraft?.(activeModel, draftQuant)
-          writeSettings({ dflash: true, mtp: false })
+          await writeSettings({ dflash: true, mtp: false })
         } else {
-          writeSettings({ dflash: false })
+          await writeSettings({ dflash: false })
         }
 
         if (activeModel) {
@@ -1660,7 +1660,7 @@ function ProviderDetail() {
             console.warn('Failed to unload before DFlash restart:', e)
           }
           try {
-            await engine.load?.(activeModel)
+            await serviceHub.models().startModel(provider, activeModel, true)
           } catch (e) {
             console.error('Failed to reload after DFlash toggle:', e)
             toast.error(errTitle, {

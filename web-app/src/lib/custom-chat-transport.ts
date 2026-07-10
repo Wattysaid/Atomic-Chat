@@ -189,6 +189,20 @@ export function foldSystemIntoFirstUserMessage<
   return copy
 }
 
+export function shouldSuppressToolsForUpstreamDflash(
+  providerId: string,
+  settings: readonly ProviderSetting[] | undefined
+): boolean {
+  return (
+    providerId === 'llamacpp-upstream' &&
+    settings?.some(
+      (setting) =>
+        setting.key === 'dflash' &&
+        setting.controller_props.value === true
+    ) === true
+  )
+}
+
 export type TokenUsageCallback = (
   usage: LanguageModelUsage,
   messageId: string
@@ -733,7 +747,12 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     const selectedModel = useModelProvider.getState().selectedModel
     const modelSupportsTools =
       selectedModel?.capabilities?.includes('tools') ?? this.modelSupportsTools
-    const shouldEnableTools = hasTools && modelSupportsTools
+    const suppressToolsForDflash = shouldSuppressToolsForUpstreamDflash(
+      effectiveProviderName,
+      provider.settings
+    )
+    const shouldEnableTools =
+      hasTools && modelSupportsTools && !suppressToolsForDflash
 
     const dropSystemForTools =
       isLocalProvider && shouldEnableTools && !!this.systemMessage
