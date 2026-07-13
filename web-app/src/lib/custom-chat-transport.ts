@@ -203,6 +203,15 @@ export function shouldSuppressToolsForUpstreamDflash(
   )
 }
 
+export function withUpstreamDflashSampling(
+  providerId: string,
+  settings: readonly ProviderSetting[] | undefined,
+  params: Record<string, unknown>
+): Record<string, unknown> {
+  if (!shouldSuppressToolsForUpstreamDflash(providerId, settings)) return params
+  return { ...params, temperature: 0 }
+}
+
 export type TokenUsageCallback = (
   usage: LanguageModelUsage,
   messageId: string
@@ -538,10 +547,14 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
         // top_k 64) is layered on at request time unless the user has tuned
         // sampling themselves — non-destructive, follows the active model.
         const samplingState = useSamplingSettings.getState()
-        const inferenceParams = withRecommendedSampling(
-          modelId,
-          samplingState.getParams(),
-          samplingState.userOverridden
+        const inferenceParams = withUpstreamDflashSampling(
+          providerId,
+          updatedProvider?.settings ?? provider.settings,
+          withRecommendedSampling(
+            modelId,
+            samplingState.getParams(),
+            samplingState.userOverridden
+          )
         )
 
         // Global "Disable reasoning" setting — best-effort: dispatch the

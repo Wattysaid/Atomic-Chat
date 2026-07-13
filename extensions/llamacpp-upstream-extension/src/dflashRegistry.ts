@@ -8,17 +8,15 @@
  * to the target model (the same way `mmproj` and Gemma 4 MTP heads are handled
  * — see gemmaMtpRegistry.ts). The upstream MLX DFlash drafts are published as
  * safetensors and would need conversion; these entries instead point at
- * community-converted GGUF repos built for mainline llama.cpp so the file can
- * be consumed directly. Fork-only `dflash-draft` / `qwen35-dflash-draft`
- * architectures are deliberately excluded.
+ * GGUF repos built for mainline llama.cpp so the file can be consumed
+ * directly. Fork-only `dflash-draft` / `qwen35-dflash-draft` architectures
+ * are deliberately excluded.
  *
  * Draft files were verified against the live Hugging Face API (sha256 + size
  * pinned so the downloader validates them). Q4_K_M remains the default
  * quality/size balance, while the settings UI can offer every compatible
- * published quant:
- *   - Qwen3.5-9B      → onion515/Qwen3.5-9B-DFlash-GGUF
- *   - Qwen3.6-27B     → williamliao/qwen3.6-27B-DFlash-GGUF
- *   - Qwen3.6-35B-A3B → williamliao/Qwen3.6-35B-A3B-DFlash-GGUF
+ * published quant. Atomic Chat's verified Q8_0 conversions are preferred when
+ * available; compatible community conversions provide the remaining quants.
  */
 
 export interface DflashDraft {
@@ -49,7 +47,111 @@ function hasQwenFamily(normalizedId: string, family: '35' | '36'): boolean {
   return compact.includes(`qwen${family}`)
 }
 
+function compactId(normalizedId: string): string {
+  return normalizedId.replace(/[\s._-]+/g, '')
+}
+
+function isBaseQwen3(normalizedId: string): boolean {
+  const compact = compactId(normalizedId)
+  return (
+    compact.includes('qwen3') &&
+    !compact.includes('qwen35') &&
+    !compact.includes('qwen36') &&
+    !compact.includes('qwen3coder')
+  )
+}
+
+function atomicQ8Draft(
+  repo: string,
+  draftFilename: string,
+  draftSha256: string,
+  draftSize: number
+): DflashDraft {
+  return {
+    quant: 'Q8_0',
+    repo,
+    draftFilename,
+    draftSha256,
+    draftSize,
+  }
+}
+
 const REGISTRY: readonly DflashRegistryEntry[] = [
+  {
+    matches: (id) => compactId(id).includes('qwen3codernext'),
+    drafts: [
+      atomicQ8Draft(
+        'AtomicChat/Qwen3-Coder-Next-DFlash-GGUF',
+        'Qwen3-Coder-Next-DFlash.Q8_0.gguf',
+        '139081af2f9f634b3b8bce8f75a0449f92bcb75ae7a2e32abaf1bcdf6f4a7952',
+        509674720
+      ),
+    ],
+  },
+  {
+    matches: (id) => {
+      const compact = compactId(id)
+      return (
+        compact.includes('qwen3coder') &&
+        compact.includes('30b') &&
+        compact.includes('a3b')
+      )
+    },
+    drafts: [
+      atomicQ8Draft(
+        'AtomicChat/Qwen3-Coder-30B-A3B-DFlash-GGUF',
+        'Qwen3-Coder-30B-A3B-DFlash.Q8_0.gguf',
+        'abd0e078f1e5683ba83c4ced92836b136d9e2e6b2626715b699088fd5c3a51fc',
+        509674848
+      ),
+    ],
+  },
+  {
+    matches: (id) => compactId(id).includes('qwen3527b'),
+    drafts: [
+      atomicQ8Draft(
+        'AtomicChat/Qwen3.5-27B-DFlash-GGUF',
+        'Qwen3.5-27B-DFlash.Q8_0.gguf',
+        'e24126896291f03a8dd6da7da8678ea4d7b019d6fc3719ecf6136e392f361645',
+        2272886944
+      ),
+    ],
+  },
+  {
+    matches: (id) => compactId(id).includes('qwen354b'),
+    drafts: [
+      atomicQ8Draft(
+        'AtomicChat/Qwen3.5-4B-DFlash-GGUF',
+        'Qwen3.5-4B-DFlash.Q8_0.gguf',
+        'f0689eadab0d46468bc2629bb2706f4aba7f794b63e1c9f6eb291269d572a52b',
+        685133984
+      ),
+    ],
+  },
+  {
+    matches: (id) =>
+      isBaseQwen3(id) && compactId(id).includes('qwen38b'),
+    drafts: [
+      atomicQ8Draft(
+        'AtomicChat/Qwen3-8B-DFlash-GGUF',
+        'Qwen3-8B-DFlash.Q8_0.gguf',
+        '5be4f6b1bfd5c2c1aa753d4c03e30700114654fefbbf29f02257ef37adb00bf0',
+        1120250336
+      ),
+    ],
+  },
+  {
+    matches: (id) =>
+      isBaseQwen3(id) && compactId(id).includes('qwen34b'),
+    drafts: [
+      atomicQ8Draft(
+        'AtomicChat/Qwen3-4B-DFlash-GGUF',
+        'Qwen3-4B-DFlash.Q8_0.gguf',
+        '2913a8a5619b30233c0745ccd58de8fbe144b831b54770eb04d4a371221ca273',
+        577047008
+      ),
+    ],
+  },
   {
     // Qwen3.5-9B (dense). e.g. Qwen3.5-9B-Instruct-Q4_K_M, qwen3.5-9b-...
     matches: (id) => hasQwenFamily(id, '35') && id.includes('9b'),
@@ -80,11 +182,11 @@ const REGISTRY: readonly DflashRegistryEntry[] = [
       },
       {
         quant: 'Q8_0',
-        repo: 'onion515/Qwen3.5-9B-DFlash-GGUF',
-        draftFilename: 'qwen3.5-9b-dflash-Q8_0.gguf',
+        repo: 'AtomicChat/Qwen3.5-9B-DFlash-GGUF',
+        draftFilename: 'Qwen3.5-9B-DFlash.Q8_0.gguf',
         draftSha256:
-          'e46abf5f10fb076050b4d42ea96726c656699e21a87c1c8bb3e59a2cc7e0f7ae',
-        draftSize: 1383768256,
+          '27b9d18e605aea9c50ef506e4b63921e0dc624cc91c63c60617a8295f153d436',
+        draftSize: 1383768224,
       },
       {
         quant: 'BF16',
@@ -190,11 +292,11 @@ const REGISTRY: readonly DflashRegistryEntry[] = [
       },
       {
         quant: 'Q8_0',
-        repo: 'williamliao/qwen3.6-27B-DFlash-GGUF',
-        draftFilename: 'Qwen3.6-27B-DFlash-Q8_0.gguf',
+        repo: 'AtomicChat/Qwen3.6-27B-DFlash-GGUF',
+        draftFilename: 'Qwen3.6-27B-DFlash.Q8_0.gguf',
         draftSha256:
-          'c37b84724fa58cc5c6b545d8b96f8617a8c3bd7f018bf608feef4d3460e0575e',
-        draftSize: 1849481536,
+          'b9be52167d0b4f5cbaffba6658bcb20dd814ad4e5846532353c165ccf97e47a1',
+        draftSize: 1849481472,
       },
       {
         quant: 'F16',
@@ -229,12 +331,14 @@ export function resolveDflashDraft(
   quant = DEFAULT_DFLASH_DRAFT_QUANT
 ): DflashDraft | null {
   const drafts = listDflashDrafts(modelId)
-  return drafts.find((draft) => draft.quant === quant) ?? null
+  const exact = drafts.find((draft) => draft.quant === quant)
+  if (exact) return exact
+  return quant === DEFAULT_DFLASH_DRAFT_QUANT ? drafts[0] ?? null : null
 }
 
 /** Whether the given model id is a DFlash-capable target. */
 export function checkDflashSupport(modelId: string): boolean {
-  return resolveDflashDraft(modelId) !== null
+  return listDflashDrafts(modelId).length > 0
 }
 
 /** Build the Hugging Face resolve URL for a DFlash draft. */

@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
-import { shouldSuppressToolsForUpstreamDflash } from '../custom-chat-transport'
+import {
+  shouldSuppressToolsForUpstreamDflash,
+  withUpstreamDflashSampling,
+} from '../custom-chat-transport'
 
 function setting(key: string, value: boolean): ProviderSetting {
   return {
@@ -35,5 +38,44 @@ describe('shouldSuppressToolsForUpstreamDflash', () => {
         setting('dflash', true),
       ])
     ).toBe(false)
+  })
+})
+
+describe('withUpstreamDflashSampling', () => {
+  it('forces greedy sampling for upstream DFlash requests', () => {
+    const params = { temperature: 0.7, top_p: 0.8 }
+
+    expect(
+      withUpstreamDflashSampling(
+        'llamacpp-upstream',
+        [setting('dflash', true)],
+        params
+      )
+    ).toEqual({ temperature: 0, top_p: 0.8 })
+    expect(params).toEqual({ temperature: 0.7, top_p: 0.8 })
+  })
+
+  it('preserves sampling when DFlash is disabled', () => {
+    const params = { temperature: 0.7 }
+
+    expect(
+      withUpstreamDflashSampling(
+        'llamacpp-upstream',
+        [setting('dflash', false)],
+        params
+      )
+    ).toBe(params)
+  })
+
+  it('preserves sampling for other providers', () => {
+    const params = { temperature: 0.7 }
+
+    expect(
+      withUpstreamDflashSampling(
+        'llamacpp',
+        [setting('dflash', true)],
+        params
+      )
+    ).toBe(params)
   })
 })
