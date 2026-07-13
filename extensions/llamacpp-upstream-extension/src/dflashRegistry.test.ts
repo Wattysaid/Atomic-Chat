@@ -6,14 +6,14 @@ import {
 } from './dflashRegistry'
 
 describe('DFlash registry', () => {
-  it('matches Qwen3.5-9B model ids with underscore separators', () => {
+  it('defaults to Atomic Chat Q8_0 across target quantizations', () => {
     const draft = resolveDflashDraft(
       'unsloth/Qwen3_5-9B-GGUF-Qwen3_5-9B-IQ4_XS'
     )
 
-    expect(draft?.repo).toBe('onion515/Qwen3.5-9B-DFlash-GGUF')
-    expect(draft?.quant).toBe('Q4_K_M')
-    expect(draft?.draftFilename).toBe('qwen3.5-9b-dflash-Q4_K_M.gguf')
+    expect(draft?.repo).toBe('AtomicChat/Qwen3.5-9B-DFlash-GGUF')
+    expect(draft?.quant).toBe('Q8_0')
+    expect(draft?.draftFilename).toBe('Qwen3.5-9B-DFlash.Q8_0.gguf')
   })
 
   it('lists every published compatible draft quantization', () => {
@@ -84,10 +84,12 @@ describe('DFlash registry', () => {
   })
 
   it('uses mainline llama.cpp DFlash GGUF repositories', () => {
-    expect(resolveDflashDraft('Qwen3.6-27B-Q4_K_M')?.repo).toBe(
+    expect(resolveDflashDraft('Qwen3.6-27B-Q4_K_M', 'Q4_K_M')?.repo).toBe(
       'williamliao/qwen3.6-27B-DFlash-GGUF'
     )
-    expect(resolveDflashDraft('Qwen3.6-35B-A3B-Q4_K_M')?.repo).toBe(
+    expect(
+      resolveDflashDraft('Qwen3.6-35B-A3B-Q4_K_M', 'Q4_K_M')?.repo
+    ).toBe(
       'williamliao/Qwen3.6-35B-A3B-DFlash-GGUF'
     )
   })

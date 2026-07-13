@@ -53,6 +53,8 @@ import {
   mergeEmbedResponses,
   isConcreteVersionBackend,
   matchesMtpLoadFailure,
+  hasEmbeddedMtp,
+  isMtpCapable,
   isCpuBackend,
   isUnsupportedNoAvxCpu,
   CPU_NO_AVX_ERROR_CODE,
@@ -3330,6 +3332,38 @@ export default class llamacpp_upstream_extension extends AIEngine {
   }
 
   /**
+   * Whether an installed Qwen GGUF contains an embedded MTP/NextN head.
+   * Capability comes from the canonical GGUF metadata rather than the local
+   * model id, which may be derived from a filename that omits "MTP".
+   */
+  async checkEmbeddedMtpSupport(modelId: string): Promise<boolean> {
+    try {
+      const janDataFolderPath = await getJanDataFolderPath()
+      const modelConfigPath = await joinPath([
+        await this.getModelsRootPath(),
+        modelId,
+        'model.yml',
+      ])
+      const modelConfig = await invoke<ModelConfig>('read_yaml', {
+        path: modelConfigPath,
+      })
+      const modelPath = await joinPath([
+        janDataFolderPath,
+        modelConfig.model_path,
+      ])
+      const gguf = await readGgufMetadata(modelPath)
+      return hasEmbeddedMtp(gguf.metadata)
+    } catch (error) {
+      logger.warn(
+        `Failed to inspect embedded MTP metadata for "${modelId}": ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+      return false
+    }
+  }
+
+  /**
    * Ensure the Gemma 4 MTP draft head GGUF is present next to the target model
    * and recorded in its `model.yml` (`mtp_draft_path`). Mirrors the MLX
    * `ensureDraftDownloaded` flow: idempotent — if the head is already on disk
@@ -3472,7 +3506,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
    * referenced in `model.yml`, it is a no-op.
    *
    * @param modelId A DFlash-capable target model id.
-   * @param quant Draft quantization selected by the user. Defaults to Q4_K_M.
+   * @param quant Draft quantization selected by the user. Defaults to Q8_0.
    * @throws if the model id is not a DFlash target.
    */
   async ensureDflashDraft(modelId: string, quant?: string): Promise<void> {
@@ -4025,15 +4059,24 @@ export default class llamacpp_upstream_extension extends AIEngine {
     // Passing it to a model that has no MTP layers makes llama-server abort the
     // load ("context type MTP requested but model doesn't contain MTP layers").
     // Only keep MTP enabled when the target actually supports it: a Qwen-style
-    // built-in MTP GGUF (its id carries "mtp", matching the UI's own heuristic)
-    // or a Gemma 4 target whose separate draft head was resolved above.
+    // built-in MTP GGUF identified by its canonical NextN metadata, or a Gemma
+    // 4 target whose separate draft head was resolved above.
     // Otherwise silently load without MTP (warn only) instead of crashing — this
     // covers every load entry point, not just the settings toggle, so the
     // Recommended Gemma 4 model can never be bricked by a stale global flag.
     if (cfg.mtp) {
-      const isQwenBuiltinMtp = modelId.toLowerCase().includes('mtp')
-      const hasGemmaDraft = cfg.mtp_draft_path.length > 0
-      if (!isQwenBuiltinMtp && !hasGemmaDraft) {
+      let ggufMetadata: Record<string, unknown> | undefined
+      try {
+        const gguf = await readGgufMetadata(modelPath)
+        ggufMetadata = gguf.metadata
+      } catch (error) {
+        logger.warn(
+          `[performLoad] Embedded MTP metadata probe failed for "${modelId}"; loading without built-in MTP: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      }
+      if (!isMtpCapable(ggufMetadata, cfg.mtp_draft_path)) {
         logger.warn(
           `MTP is enabled but model "${modelId}" has no MTP layers and no draft head; loading without MTP.`
         )

@@ -476,19 +476,20 @@ function ProviderDetail() {
 
     let cancelled = false
     const reconcile = async () => {
-      /// Same capability heuristic as `handleToggleLlamacppMtp` / the load gate:
-      /// a Qwen built-in-MTP GGUF (id carries "mtp") or a Gemma 4 MTP target.
-      const isQwenMtp = modelId.toLowerCase().includes('mtp')
-      let capable = isQwenMtp
-      if (!capable) {
-        try {
-          const engine = EngineManager.instance().get('llamacpp-upstream') as {
-            checkGemmaMtpSupport?: (id: string) => Promise<boolean>
-          } | null
-          capable = (await engine?.checkGemmaMtpSupport?.(modelId)) ?? false
-        } catch {
-          capable = false
-        }
+      /// Match `handleToggleLlamacppMtp` and the load gate: inspect canonical
+      /// GGUF metadata for a built-in Qwen MTP head, then check the separate
+      /// Gemma 4 draft registry.
+      let capable = false
+      try {
+        const engine = EngineManager.instance().get('llamacpp-upstream') as {
+          checkEmbeddedMtpSupport?: (id: string) => Promise<boolean>
+          checkGemmaMtpSupport?: (id: string) => Promise<boolean>
+        } | null
+        capable =
+          ((await engine?.checkEmbeddedMtpSupport?.(modelId)) ?? false) ||
+          ((await engine?.checkGemmaMtpSupport?.(modelId)) ?? false)
+      } catch {
+        capable = false
       }
       if (cancelled || capable) return
 
@@ -1426,11 +1427,9 @@ function ProviderDetail() {
     ]
   )
 
-  /// Toggle the upstream-llama MTP flag (`--spec-type draft-mtp`). Unlike
-  /// the MLX MTP/DFlash toggles, there is no companion download — the MTP
-  /// head ships inside the same GGUF as the target. Capability is decided
-  /// by a simple substring check on the model id ("...MTP..."), matching
-  /// the ggml-org/Qwen3.6-*-MTP-GGUF naming convention.
+  /// Toggle the upstream-llama MTP flag (`--spec-type draft-mtp`). Qwen
+  /// capability is read from canonical GGUF metadata; Gemma 4 uses a separate
+  /// draft head downloaded by the extension.
   ///
   /// On enable, if a model is already running, we stop it and reload with
   /// the new args so the toggle takes effect immediately (parity with the
@@ -1478,14 +1477,15 @@ function ProviderDetail() {
       try {
         if (nextEnabled) {
           /// Capability check. Two MTP shapes are supported:
-          ///  - Qwen built-in MTP: the ggml-org collection always includes
-          ///    "MTP" in the repo / file name (head inside the same GGUF).
+          ///  - Qwen built-in MTP: canonical GGUF metadata reports the embedded
+          ///    NextN layers (head inside the same GGUF).
           ///  - Gemma 4 MTP (31B / 26B-A4B): needs a SEPARATE draft head GGUF
           ///    downloaded next to the model (PR #23398).
           /// If the loaded model id is neither, refuse the toggle and surface
           /// the popup — don't write the setting (the Switch stays off).
           if (activeModel) {
-            const isQwenMtp = activeModel.toLowerCase().includes('mtp')
+            const isQwenMtp =
+              (await engine.checkEmbeddedMtpSupport?.(activeModel)) ?? false
             if (!isQwenMtp) {
               const isGemmaMtp =
                 (await engine.checkGemmaMtpSupport?.(activeModel)) ?? false

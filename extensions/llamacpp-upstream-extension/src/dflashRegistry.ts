@@ -13,10 +13,10 @@
  * are deliberately excluded.
  *
  * Draft files were verified against the live Hugging Face API (sha256 + size
- * pinned so the downloader validates them). Q4_K_M remains the default
- * quality/size balance, while the settings UI can offer every compatible
- * published quant. Atomic Chat's verified Q8_0 conversions are preferred when
- * available; compatible community conversions provide the remaining quants.
+ * pinned so the downloader validates them). Atomic Chat's verified Q8_0
+ * conversions are the default for every target-model quantization when
+ * available; compatible community conversions provide the remaining draft
+ * choices and cover families without an Atomic Chat conversion.
  */
 
 export interface DflashDraft {
@@ -310,7 +310,7 @@ const REGISTRY: readonly DflashRegistryEntry[] = [
   },
 ]
 
-export const DEFAULT_DFLASH_DRAFT_QUANT = 'Q4_K_M'
+export const DEFAULT_DFLASH_DRAFT_QUANT = 'Q8_0'
 
 function normalizeId(modelId: string): string {
   return modelId.toLowerCase()

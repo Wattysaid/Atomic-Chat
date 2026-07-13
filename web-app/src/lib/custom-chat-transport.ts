@@ -209,7 +209,40 @@ export function withUpstreamDflashSampling(
   params: Record<string, unknown>
 ): Record<string, unknown> {
   if (!shouldSuppressToolsForUpstreamDflash(providerId, settings)) return params
-  return { ...params, temperature: 0 }
+  return {
+    ...params,
+    temperature: 0,
+    top_k: 1,
+    repeat_penalty: 1,
+    presence_penalty: 0,
+    frequency_penalty: 0,
+  }
+}
+
+export function withUpstreamDflashReasoningOverride(
+  providerId: string,
+  settings: readonly ProviderSetting[] | undefined,
+  override: Record<string, unknown>
+): Record<string, unknown> {
+  if (!shouldSuppressToolsForUpstreamDflash(providerId, settings)) {
+    return override
+  }
+
+  const existingTemplateKwargs =
+    typeof override.chat_template_kwargs === 'object' &&
+    override.chat_template_kwargs !== null &&
+    !Array.isArray(override.chat_template_kwargs)
+      ? (override.chat_template_kwargs as Record<string, unknown>)
+      : {}
+
+  return {
+    ...override,
+    chat_template_kwargs: {
+      ...existingTemplateKwargs,
+      enable_thinking: false,
+    },
+    reasoning_budget: 0,
+  }
 }
 
 export type TokenUsageCallback = (
@@ -547,9 +580,11 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
         // top_k 64) is layered on at request time unless the user has tuned
         // sampling themselves — non-destructive, follows the active model.
         const samplingState = useSamplingSettings.getState()
+        const providerSettings =
+          updatedProvider?.settings ?? provider.settings
         const inferenceParams = withUpstreamDflashSampling(
           providerId,
-          updatedProvider?.settings ?? provider.settings,
+          providerSettings,
           withRecommendedSampling(
             modelId,
             samplingState.getParams(),
@@ -628,7 +663,14 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
           reasoningOverride.reasoning_budget =
             reasoningBudgetTokens[reasoningBudget]
         }
-        const hasOverride = Object.keys(reasoningOverride).length > 0
+        const effectiveReasoningOverride =
+          withUpstreamDflashReasoningOverride(
+            providerId,
+            providerSettings,
+            reasoningOverride
+          )
+        const hasOverride =
+          Object.keys(effectiveReasoningOverride).length > 0
 
         // Audio attachments (omni/audio-capable models, MLX backend) are
         // injected as `input_audio` at the MLX fetch layer rather than as
@@ -644,7 +686,7 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
           modelId,
           updatedProvider ?? provider,
           inferenceParams ?? {},
-          hasOverride ? reasoningOverride : undefined,
+          hasOverride ? effectiveReasoningOverride : undefined,
           audioInputParts.length > 0 ? audioInputParts : undefined
         )
         ttftMark('deltaEnd')

@@ -13,7 +13,7 @@
   {
     "key": "mtp",
     "title": "Enable MTP (Multi-Token Prediction)",
-    "description": "Speculative decoding via an MTP head. Works with built-in-MTP GGUFs (e.g. [ggml-org/Qwen3.6-27B-MTP-GGUF](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF), [ggml-org/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF)) and with Gemma 4 31B ([am17an/Gemma4-31B-it-GGUF](https://huggingface.co/am17an/Gemma4-31B-it-GGUF)) / 26B-A4B ([AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF)) — a separate draft head is downloaded automatically; requires backend build b9553+.",
+    "description": "Speculative decoding via an MTP head. Built-in Qwen MTP support is detected from the GGUF NextN metadata, regardless of the repository or filename (e.g. [ggml-org/Qwen3.6-27B-MTP-GGUF](https://huggingface.co/ggml-org/Qwen3.6-27B-MTP-GGUF), [ggml-org/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-MTP-GGUF)). Gemma 4 31B ([am17an/Gemma4-31B-it-GGUF](https://huggingface.co/am17an/Gemma4-31B-it-GGUF)) / 26B-A4B ([AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF)) use a separate draft head that is downloaded automatically; requires backend build b9553+.",
     "controllerType": "checkbox",
     "controllerProps": {
       "value": false
@@ -22,7 +22,7 @@
   {
     "key": "dflash",
     "title": "Enable DFlash (multi-layer draft speculative decoding)",
-    "description": "Speculative decoding via a separate multi-layer DFlash draft GGUF. When enabled, Atomic Chat lets you choose the draft quantization before downloading it. Atomic Chat probes the selected llama-server binary before load and only passes --spec-type draft-dflash when that backend advertises support. Supported targets: Qwen3.5-9B ([onion515/Qwen3.5-9B-DFlash-GGUF](https://huggingface.co/onion515/Qwen3.5-9B-DFlash-GGUF)), Qwen3.6-27B ([williamliao/qwen3.6-27B-DFlash-GGUF](https://huggingface.co/williamliao/qwen3.6-27B-DFlash-GGUF)), Qwen3.6-35B-A3B ([williamliao/Qwen3.6-35B-A3B-DFlash-GGUF](https://huggingface.co/williamliao/Qwen3.6-35B-A3B-DFlash-GGUF)). Mutually exclusive with MTP.",
+    "description": "Speed up generation with a compatible DFlash draft model. Atomic Chat offers a matching draft download when available. Requires a DFlash-capable llama.cpp backend and is mutually exclusive with MTP. [Browse Atomic Chat DFlash models](https://huggingface.co/collections/AtomicChat/dflash-speculative-drafts).",
     "controllerType": "checkbox",
     "controllerProps": {
       "value": false

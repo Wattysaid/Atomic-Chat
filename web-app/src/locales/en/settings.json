@@ -10,7 +10,7 @@
   "llamacppDflashBackendUnsupported": "The selected Llama.cpp backend does not advertise DFlash support (--spec-type draft-dflash). Update or switch to a compatible backend before enabling DFlash.",
   "llamacppDflashNoActiveModel": "Start a Llama.cpp model before enabling DFlash.",
   "llamacppDflashDraftTitle": "Choose DFlash draft quantization",
-  "llamacppDflashDraftDesc": "Select the additional draft GGUF to pair with {{modelId}}. Q4_K_M is recommended for the best size and quality balance.",
+  "llamacppDflashDraftDesc": "Select the additional draft GGUF to pair with {{modelId}}. Atomic Chat Q8_0 is selected by default when available.",
   "llamacppDflashDraftQuantLabel": "Draft quantization",
   "llamacppDflashDraftDownload": "Download and enable",
   "llamacppDflashDownloadingDraft": "Downloading {{quant}} DFlash draft model…",

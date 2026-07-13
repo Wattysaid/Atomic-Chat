@@ -10,7 +10,7 @@
   "llamacppDflashBackendUnsupported": "Выбранный backend Llama.cpp не сообщает о поддержке DFlash (--spec-type draft-dflash). Обновите или переключите backend на совместимый перед включением DFlash.",
   "llamacppDflashNoActiveModel": "Сначала запустите Llama.cpp модель.",
   "llamacppDflashDraftTitle": "Выберите квантование DFlash draft-модели",
-  "llamacppDflashDraftDesc": "Выберите дополнительный draft GGUF для {{modelId}}. Q4_K_M рекомендуется как оптимальный баланс размера и качества.",
+  "llamacppDflashDraftDesc": "Выберите дополнительный draft GGUF для {{modelId}}. При наличии по умолчанию выбирается Atomic Chat Q8_0.",
   "llamacppDflashDraftQuantLabel": "Квантование draft-модели",
   "llamacppDflashDraftDownload": "Скачать и включить",
   "llamacppDflashDownloadingDraft": "Скачивается DFlash draft-модель {{quant}}…",

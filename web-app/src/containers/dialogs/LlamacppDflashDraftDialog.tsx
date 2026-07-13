@@ -40,7 +40,7 @@ export function LlamacppDflashDraftDialog({
 }: LlamacppDflashDraftDialogProps) {
   const { t } = useTranslation()
   const defaultQuant = useMemo(
-    () => options.find((option) => option.quant === 'Q4_K_M')?.quant ?? options[0]?.quant ?? '',
+    () => options.find((option) => option.quant === 'Q8_0')?.quant ?? options[0]?.quant ?? '',
     [options]
   )
   const [selectedQuant, setSelectedQuant] = useState(defaultQuant)
@@ -64,7 +64,7 @@ export function LlamacppDflashDraftDialog({
           <DialogDescription>
             {t('settings:llamacppDflashDraftDesc', {
               defaultValue:
-                'Select the additional draft GGUF to pair with {{modelId}}. Q4_K_M is recommended for the best size and quality balance.',
+                'Select the additional draft GGUF to pair with {{modelId}}. Atomic Chat Q8_0 is selected by default when available.',
               modelId,
             })}
           </DialogDescription>
