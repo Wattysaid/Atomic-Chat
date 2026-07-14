@@ -2373,9 +2373,8 @@ export default class llamacpp_extension extends AIEngine {
           downloadType: 'Model',
         })
       } catch (error) {
-        logger.error('Error downloading model:', modelId, opts, error)
-        const errorMessage =
-          error instanceof Error ? error.message : String(error)
+        const errorMessage = formatLoadError(error)
+        logger.error('Error downloading model:', modelId, errorMessage)
 
         // Check if this is a cancellation
         const isCancellationError =
