@@ -5,6 +5,7 @@ const COMMANDS: &[&str] = &[
     "load_llama_model",
     "unload_llama_model",
     "get_devices",
+    "check_spec_type_support",
     "generate_api_key",
     "is_process_running",
     "get_random_port",
@@ -32,6 +33,8 @@ const COMMANDS: &[&str] = &[
     "validate_backend_string",
     "should_migrate_backend",
     "handle_setting_update",
+    "install_bundled_backend",
+    "fetch_manifest_http1",
 ];
 
 fn main() {

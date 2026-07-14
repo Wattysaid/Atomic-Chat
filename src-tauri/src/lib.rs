@@ -108,6 +108,7 @@ pub fn run() {
         core::filesystem::commands::write_yaml,
         core::filesystem::commands::read_yaml,
         core::filesystem::commands::decompress,
+        core::filesystem::commands::normalize_backend_layout,
         core::filesystem::commands::open_dialog,
         core::filesystem::commands::save_dialog,
         // App configuration commands
@@ -129,6 +130,7 @@ pub fn run() {
         core::system::commands::open_file_explorer,
         core::system::commands::factory_reset,
         core::system::commands::read_logs,
+        core::system::commands::show_desktop_notification,
         core::system::commands::get_installer_type,
         core::system::commands::is_library_available,
         core::system::commands::launch_claude_code_with_config,
@@ -143,6 +145,7 @@ pub fn run() {
         core::system::commands::install_agent,
         core::system::commands::configure_codex,
         core::system::commands::configure_opencode,
+        core::system::commands::configure_openclaude,
         core::system::commands::configure_cline,
         core::system::commands::configure_mimo,
         core::system::commands::configure_zed,
@@ -155,6 +158,7 @@ pub fn run() {
         core::system::commands::configure_goose,
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
+        core::system::commands::configure_poolside,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
         // Server commands
@@ -197,6 +201,7 @@ pub fn run() {
         core::updater::commands::is_update_available,
         // HTTP (bypasses tauri_plugin_http fetch interception)
         core::http::post_local_http,
+        core::http::get_local_http,
         core::http::stream_local_http,
         // HTML artifact preview (served via the artifact:// protocol)
         core::artifact::set_artifact_html,
@@ -226,6 +231,7 @@ pub fn run() {
         core::filesystem::commands::write_yaml,
         core::filesystem::commands::read_yaml,
         core::filesystem::commands::decompress,
+        core::filesystem::commands::normalize_backend_layout,
         core::filesystem::commands::open_dialog,
         core::filesystem::commands::save_dialog,
         // App configuration commands
@@ -247,6 +253,7 @@ pub fn run() {
         core::system::commands::open_file_explorer,
         core::system::commands::factory_reset,
         core::system::commands::read_logs,
+        core::system::commands::show_desktop_notification,
         core::system::commands::get_installer_type,
         core::system::commands::is_library_available,
         core::system::commands::launch_claude_code_with_config,
@@ -261,6 +268,7 @@ pub fn run() {
         core::system::commands::install_agent,
         core::system::commands::configure_codex,
         core::system::commands::configure_opencode,
+        core::system::commands::configure_openclaude,
         core::system::commands::configure_cline,
         core::system::commands::configure_mimo,
         core::system::commands::configure_zed,
@@ -273,6 +281,7 @@ pub fn run() {
         core::system::commands::configure_goose,
         core::system::commands::configure_openhands,
         core::system::commands::configure_kilo,
+        core::system::commands::configure_poolside,
         core::system::commands::open_agent_terminal,
         core::system::commands::launch_editor,
         // Server commands
@@ -365,6 +374,14 @@ pub fn run() {
             #[cfg(any(target_os = "ios", target_os = "android"))]
             app.handle().plugin(log_builder.build())?;
 
+            // Reap backend processes orphaned by a previous *abnormal* exit
+            // (crash / OOM / Force Quit / SIGKILL — none of which run our
+            // RunEvent::Exit cleanup) before any engine spawns. Single-instance
+            // guarantees these can only be our own leftovers. Kept after logger
+            // init so its actions are recorded in app.log.
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            crate::core::process_reaper::reap_orphan_backends(app.handle());
+
             #[cfg(target_os = "windows")]
             {
                 if let Err(e) = crate::core::notifications::ensure_aumid_registered(
@@ -384,6 +401,8 @@ pub fn run() {
                 let backends_dir = get_jan_data_folder_path(app.handle().clone())
                     .join("llamacpp-upstream")
                     .join("backends");
+                // block_on is safe here: the setup closure runs on the main
+                // thread, which is never a tokio runtime worker.
                 match tauri::async_runtime::block_on(install_bundled_backend(
                     app.handle().clone(),
                     backends_dir.to_string_lossy().to_string(),
@@ -508,7 +527,10 @@ pub fn run() {
 
             let state = app_handle.state::<AppState>();
 
-            // Check if cleanup already ran
+            // Check if cleanup already ran.
+            // block_on is safe here: RunEvent callbacks run on the main
+            // thread, which is never a tokio runtime worker (block_in_place
+            // is a pass-through outside a runtime).
             let cleanup_already_running = tokio::task::block_in_place(|| {
                 tauri::async_runtime::block_on(async {
                     let handle = state.background_cleanup_handle.lock().await;

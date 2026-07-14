@@ -324,12 +324,734 @@ Append-only. Newest at top. Each entry follows this shape:
  partial data when the server supports ranges, while non-range servers safely
  restart instead of appending incompatible content. Retry exhaustion and
  malformed range responses now produce actionable errors; cancellation remains
- immediate. Integration tests cover both resume and full-restart paths.
+ immediate. Integration tests cover resume, full-restart, and mismatched-range
+ paths.
 - **Owner:** team.
 - **Links:** [ATO-232](https://linear.app/atomicchat/issue/ATO-232),
  [PR #120](https://github.com/AtomicBot-ai/Atomic-Chat/pull/120),
  [`src-tauri/src/core/downloads/helpers.rs`](src-tauri/src/core/downloads/helpers.rs),
  [`src-tauri/src/core/downloads/tests.rs`](src-tauri/src/core/downloads/tests.rs).
+
+### 2026-07-13 — Run tray status synchronization on Windows
+- **Context:** The Windows tray menu shipped and emitted the same
+  `tray-start-server` / `tray-stop-server` events as macOS, but the React hook
+  that updates its server/model/RAM rows and listens for those events returned
+  early unless `IS_MACOS` was true. On Windows the menu therefore stayed on
+  its initial "Server Stopped" placeholders and its Start/Stop action did
+  nothing.
+- **Decision:** Mount the existing tray synchronization and event-listener
+  effects on Windows Tauri builds as well as macOS. Keep web, mobile, and Linux
+  excluded.
+- **Consequences:** The Windows tray reflects live state and its Start/Stop
+  action reaches the existing Local API Server flow. macOS behavior is
+  unchanged. No IPC, settings, or server lifecycle changes.
+- **Owner:** team.
+- **Links:** [Issue #167](https://github.com/AtomicBot-ai/Atomic-Chat/issues/167),
+  [`web-app/src/hooks/useTrayStatusSync.ts`](web-app/src/hooks/useTrayStatusSync.ts),
+  [`web-app/src/routes/__root.tsx`](web-app/src/routes/__root.tsx).
+
+### 2026-07-13 — Default upstream DFlash downloads to Atomic Chat Q8_0 for every target quantization
+- **Context:** The upstream DFlash picker defaulted to a community Q4_K_M
+  draft even when the selected target family had a verified Atomic Chat Q8_0
+  conversion. Target-model quantization does not constrain the separate
+  DFlash draft quantization, so IQ4, Q4, Q5, and other target GGUFs can all
+  pair with the same Q8_0 draft.
+- **Decision:** Change the registry and picker default from Q4_K_M to Q8_0.
+  When an Atomic Chat Q8_0 draft exists, enabling DFlash now selects and
+  downloads it regardless of the target model's quantization. Keep the other
+  compatible draft quantizations available for explicit selection, and keep
+  community Q8_0 as the fallback for families without a published Atomic Chat
+  conversion.
+- **Consequences:** Atomic Chat's draft repositories become the default test
+  path without removing previously supported community drafts or changing
+  existing `dflash_draft_path` values. Qwen 3.6 35B-A3B continues to use its
+  verified community-hosted Q8_0 draft until an Atomic Chat conversion is
+  published.
+- **Owner:** team.
+- **Links:** [`extensions/llamacpp-upstream-extension/src/dflashRegistry.ts`](extensions/llamacpp-upstream-extension/src/dflashRegistry.ts),
+  [`web-app/src/containers/dialogs/LlamacppDflashDraftDialog.tsx`](web-app/src/containers/dialogs/LlamacppDflashDraftDialog.tsx).
+
+### 2026-07-13 — Detect embedded Qwen MTP from canonical GGUF metadata
+- **Context:** The `llamacpp-upstream` load and Settings gates treated a Qwen
+  model as built-in MTP-capable only when its Atomic Chat model id contained
+  `mtp`. Valid combined GGUFs can be imported under ordinary filenames, so
+  their embedded MTP head was silently disabled despite the file carrying the
+  metadata llama.cpp itself uses.
+- **Decision:** Read `general.architecture`,
+  `<architecture>.nextn_predict_layers`, and `<architecture>.block_count` from
+  the existing GGUF metadata IPC. Accept embedded MTP only for implemented
+  `qwen35` / `qwen35moe` architectures when
+  `block_count > nextn_predict_layers > 0`. Use this capability check in both
+  the load-time gate and Settings UI. Keep Gemma 4 on its separate downloaded
+  `mtp_draft_path` branch, and keep the built-in Qwen launch arguments at
+  `--spec-type draft-mtp --spec-draft-n-max 2` without `--model-draft`.
+- **Consequences:** Correct combined Qwen GGUFs use MTP regardless of repository
+  or filename. Missing, malformed, or unsupported metadata conservatively
+  disables MTP, while the existing one-shot retry without MTP remains a final
+  load safeguard. No Rust parser, IPC shape, or speculative-window change.
+- **Owner:** team.
+- **Links:** [`extensions/llamacpp-upstream-extension/src/util.ts`](extensions/llamacpp-upstream-extension/src/util.ts),
+  [`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts),
+  [`web-app/src/routes/settings/providers/$providerName.tsx`](web-app/src/routes/settings/providers/$providerName.tsx),
+  [`src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/args.rs`](src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/args.rs).
+
+### 2026-07-13 — Apply a request-local throughput profile whenever `llamacpp-upstream` DFlash is enabled
+- **Context:** The initial DFlash request override forced only
+  `temperature: 0`. The upstream llama.cpp DFlash reference command also uses
+  `top-k 1`, and DFlash acceptance drops when thinking generation or sampling
+  penalties move target selection away from the draft model's predictions.
+- **Decision:** Extend the request-local DFlash override to set
+  `temperature: 0`, `top_k: 1`, `repeat_penalty: 1`,
+  `presence_penalty: 0`, and `frequency_penalty: 0`. Independently force
+  `chat_template_kwargs.enable_thinking: false` and `reasoning_budget: 0`.
+  Preserve all unrelated request parameters and never write these overrides to
+  the global Sampling or General settings stores. Keep DFlash block size and
+  draft quantization user-selectable.
+- **Consequences:** DFlash requests use deterministic, non-thinking generation
+  with neutral penalties to maximize draft acceptance and per-request
+  throughput. Disabling DFlash or switching providers immediately restores the
+  user's persisted sampling and reasoning choices.
+- **Owner:** team.
+- **Links:** [llama.cpp DFlash PR #22105](https://github.com/ggml-org/llama.cpp/pull/22105),
+  [`web-app/src/lib/custom-chat-transport.ts`](web-app/src/lib/custom-chat-transport.ts),
+  [`web-app/src/lib/__tests__/dflashToolIsolation.test.ts`](web-app/src/lib/__tests__/dflashToolIsolation.test.ts).
+
+### 2026-07-13 — Offer every published Atomic Chat DFlash GGUF to `llamacpp-upstream`
+- **Context:** Atomic Chat now publishes eight MIT-licensed Q8_0 DFlash GGUF
+  conversions on Hugging Face, while the upstream llama.cpp DFlash registry
+  covered only three target families and downloaded exclusively from community
+  repositories.
+- **Decision:** Register the published Atomic Chat Q8_0 drafts for Qwen3 4B/8B,
+  Qwen3.5 4B/9B/27B, Qwen3.6 27B, Qwen3-Coder 30B-A3B, and
+  Qwen3-Coder-Next. Prefer the Atomic Chat Q8_0 file for the two previously
+  supported families while retaining their other community-hosted
+  quantizations. Keep Qwen3.6 35B-A3B on its existing community source because
+  Atomic Chat does not publish that draft. Pin every Atomic Chat file's live
+  Hugging Face LFS SHA-256 and byte size.
+- **Consequences:** Users running any matching target are offered the
+  additional Q8_0 draft download directly from the Atomic Chat organization.
+  Existing quant choices remain available for Qwen3.5 9B, Qwen3.6 27B, and
+  Qwen3.6 35B-A3B. Families with only a published Q8_0 draft fall back to that
+  sole option when no quant is specified.
+- **Owner:** team.
+- **Links:** [`extensions/llamacpp-upstream-extension/src/dflashRegistry.ts`](extensions/llamacpp-upstream-extension/src/dflashRegistry.ts),
+  [`extensions/llamacpp-upstream-extension/src/dflashRegistry.test.ts`](extensions/llamacpp-upstream-extension/src/dflashRegistry.test.ts),
+  [AtomicChat models](https://huggingface.co/AtomicChat/models).
+
+### 2026-07-13 — Force greedy sampling for `llamacpp-upstream` DFlash requests
+- **Context:** DFlash speculative decoding on the upstream llama.cpp provider
+  requires deterministic target sampling, while Atomic Chat's global sampling
+  defaults include a non-zero temperature.
+- **Decision:** At request construction, when the selected provider is
+  `llamacpp-upstream` and its DFlash setting is enabled, override only the
+  effective request parameters with `temperature: 0`. Do not modify the
+  persisted global Sampling store.
+- **Consequences:** DFlash requests use greedy sampling regardless of the
+  user's global temperature. Disabling DFlash or switching providers
+  immediately restores the user's existing sampling value because it was
+  never overwritten.
+- **Owner:** team.
+- **Links:** [`web-app/src/lib/custom-chat-transport.ts`](web-app/src/lib/custom-chat-transport.ts),
+  [`web-app/src/lib/__tests__/dflashToolIsolation.test.ts`](web-app/src/lib/__tests__/dflashToolIsolation.test.ts).
+
+### 2026-07-10 — Isolate `llamacpp-upstream` DFlash requests from tools and preserve model settings on restart
+- **Context:** A user log showed that DFlash itself loaded successfully
+  (`draft-dflash` registered and non-zero acceptance), but the next request
+  included an MCP Exa tool result. The same log showed the settings-page
+  DFlash restart changing the model from its persisted GPU/context settings
+  (`-ngl -1`, 16K context) to raw engine defaults (`-ngl 0`, auto 262K
+  context), because the UI called `engine.load(modelId)` without the model's
+  stored settings.
+- **Decision:** At the final `streamText` tool gate, suppress both RAG and MCP
+  tool definitions when the selected provider is `llamacpp-upstream` and its
+  `dflash` provider setting is enabled. Keep MCP connections and configuration
+  intact; only the affected request receives no `tools` or `toolChoice`.
+  During a settings-page DFlash toggle, await the provider-setting write before
+  restarting, then restart through `serviceHub.models().startModel(...)`
+  instead of the raw engine load so persisted model-level settings are applied.
+- **Consequences:** Upstream DFlash sessions no longer receive tool calls or
+  large tool-result follow-ups, while non-DFlash and other-provider sessions
+  retain existing tool behavior. DFlash restarts preserve context, GPU layer,
+  batch, and other per-model settings. This is request-level isolation, not a
+  global MCP disable.
+- **Owner:** team.
+- **Links:** [`web-app/src/lib/custom-chat-transport.ts`](web-app/src/lib/custom-chat-transport.ts),
+  [`web-app/src/routes/settings/providers/$providerName.tsx`](web-app/src/routes/settings/providers/$providerName.tsx),
+  [`web-app/src/lib/__tests__/dflashToolIsolation.test.ts`](web-app/src/lib/__tests__/dflashToolIsolation.test.ts).
+
+### 2026-07-10 — Let users choose the `llamacpp-upstream` DFlash draft quantization before download
+- **Context:** The upstream DFlash registry initially pinned one Q4_K_M draft
+  per supported target. All three compatible Hugging Face repositories publish
+  several mainline-llama.cpp GGUF quantizations, but enabling DFlash downloaded
+  Q4_K_M immediately with no user choice. The existing MLX DFlash dialog
+  already established a quant-picker pattern.
+- **Decision:** Store every verified compatible draft variant (quant label,
+  filename, SHA-256, and byte size) in `dflashRegistry.ts`, keep Q4_K_M as the
+  default, and expose the matching variants through the extension engine.
+  Enabling DFlash for a supported active target now opens a draft-quant picker
+  before download. Non-default variants use quant-qualified local filenames;
+  the selected path is written to the existing `dflash_draft_path` field in
+  `model.yml`.
+- **Consequences:** Users can trade draft memory/disk usage against quality
+  before downloading, while automatic/lazy setup remains backward-compatible
+  and defaults to Q4_K_M. Previously downloaded Q4_K_M drafts keep their
+  existing `dflash-draft.gguf` path. Selecting another quant keeps the old file
+  on disk; automatic cleanup of unselected draft variants is deliberately out
+  of scope.
+- **Owner:** team.
+- **Links:** [`extensions/llamacpp-upstream-extension/src/dflashRegistry.ts`](extensions/llamacpp-upstream-extension/src/dflashRegistry.ts),
+  [`web-app/src/containers/dialogs/LlamacppDflashDraftDialog.tsx`](web-app/src/containers/dialogs/LlamacppDflashDraftDialog.tsx),
+  [`web-app/src/routes/settings/providers/$providerName.tsx`](web-app/src/routes/settings/providers/$providerName.tsx).
+
+### 2026-07-10 — Pin `llamacpp-upstream` DFlash drafts converted for mainline llama.cpp
+- **Context:** The original DFlash GGUF registry mixed incompatible conversion
+  formats. `Anbeeld/Qwen3.5-9B-DFlash-GGUF` identifies its architecture as
+  `dflash-draft` and targets BeeLlama.cpp, so official llama.cpp `b9937`
+  rejected it with `unknown model architecture: 'dflash-draft'`. The
+  `spiritbuun/Qwen3.6-27B-DFlash-GGUF` entry was likewise converted with
+  `spiritbuun/buun-llama-cpp` for its fork-specific Qwen 3.6 sliding-window
+  metadata. A direct test of
+  `onion515/Qwen3.5-9B-DFlash-GGUF` Q4_K_M against the official `b9937`
+  binary loaded successfully and generated with non-zero speculative
+  acceptance (`draft_n=285`, `draft_n_accepted=33`).
+- **Decision:** Keep the three strict target-family matchers, but pin only
+  repositories whose model cards identify architecture `dflash` and explicit
+  mainline llama.cpp `b9831+` compatibility. Qwen 3.5 9B now uses
+  `onion515/Qwen3.5-9B-DFlash-GGUF`; Qwen 3.6 27B now uses
+  `williamliao/qwen3.6-27B-DFlash-GGUF`; Qwen 3.6 35B-A3B keeps the already
+  compatible `williamliao/Qwen3.6-35B-A3B-DFlash-GGUF`. Pin each Q4_K_M
+  filename, byte size, and Hugging Face LFS SHA-256 from the live API.
+- **Consequences:** Fresh DFlash downloads for all three registered Qwen
+  families now use the mainline `dflash` GGUF schema expected by the official
+  upstream provider instead of fork-only architecture names. Existing
+  `dflash-draft.gguf` files are not migrated or revalidated automatically;
+  users who already downloaded an incompatible draft must remove it and run
+  DFlash setup again. Automatic draft migration is outside this registry-only
+  change.
+- **Owner:** team.
+- **Links:** [llama.cpp PR #22105](https://github.com/ggml-org/llama.cpp/pull/22105),
+  [`extensions/llamacpp-upstream-extension/src/dflashRegistry.ts`](extensions/llamacpp-upstream-extension/src/dflashRegistry.ts),
+  [`extensions/llamacpp-upstream-extension/src/dflashRegistry.test.ts`](extensions/llamacpp-upstream-extension/src/dflashRegistry.test.ts),
+  [onion515/Qwen3.5-9B-DFlash-GGUF](https://huggingface.co/onion515/Qwen3.5-9B-DFlash-GGUF),
+  [williamliao/qwen3.6-27B-DFlash-GGUF](https://huggingface.co/williamliao/qwen3.6-27B-DFlash-GGUF),
+  [williamliao/Qwen3.6-35B-A3B-DFlash-GGUF](https://huggingface.co/williamliao/Qwen3.6-35B-A3B-DFlash-GGUF).
+
+### 2026-07-10 — Probe `llamacpp-upstream` DFlash support and reject mislabeled bundled binaries
+- **Context:** A user enabled DFlash on
+  `unsloth/Qwen3_5-9B-GGUF-Qwen3_5-9B-IQ4_XS` with upstream backend
+  `b9937/macos-arm64`. The DFlash draft resolved, but the selected binary rejected
+  `--spec-type draft-dflash` with `unknown speculative type: draft-dflash`;
+  its help output listed only `none,draft-simple,draft-eagle3,draft-mtp,...`.
+  Direct inspection proved the directory label was false: `llama-server
+  --version` reported build `9222 (9a532ae4b)`, while the genuine official
+  `b9937` binary reports build `9937` and advertises `draft-dflash`. The macOS
+  Make target wrote the new `version.txt` before extracting into a resource
+  directory that still contained the old `build/bin`; because that destination
+  already existed, relocation of the newly-extracted archive was skipped.
+- **Decision:** Keep the model-level DFlash registry in place, but make backend
+  support dynamic instead of hard-coded. The upstream Rust plugin now exposes
+  `check_spec_type_support(backend_path, spec_type, envs)`, which runs the
+  selected `llama-server -h` with the same CUDA/library-path setup used by
+  other backend probes and checks whether the help text advertises
+  `draft-dflash`. The guest-js layer exposes `checkSpecTypeSupport`, and the
+  TS extension uses it both in `checkDflashBackendSupport()` (Settings toggle)
+  and in `performLoad()` before calling `loadLlamaModel`. The probe result is
+  passed to Rust as `LlamacppConfig.dflash_spec_supported`; the arg builder
+  emits `--model-draft ... --spec-type draft-dflash` only when both
+  `dflash=true` and `dflash_spec_supported=true`. The serde default stays
+  `false`, so stale configs and older extension bundles cannot crash older
+  binaries. The macOS download target now clears the resource directory before
+  extracting a release. `install_bundled_backend` independently runs
+  `llama-server --version`: it refuses a bundled resource whose executable does
+  not match `version.txt`, and replaces an existing installed directory when
+  its executable is mislabeled.
+- **Consequences:** Existing users with `dflash: true` no longer crash on model
+  load when the selected backend genuinely lacks DFlash. Correct `b9937`
+  resources advertise and enable DFlash, while mislabeled resources can no
+  longer masquerade as an updated backend. The local resource was rebuilt and
+  verified as `version: 9937 (2021515a1)` with `draft-dflash` present in
+  `--spec-type`. Additive IPC only; no settings-schema change.
+- **Owner:** team.
+- **Links:** files:
+  [`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts)
+  (`checkDflashBackendSupport`, `backendSupportsDflashSpec`, load-time probe),
+  [`src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/args.rs`](src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/args.rs)
+  (`dflash_spec_supported`, conditional `add_dflash_args`),
+  [`src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/commands.rs`](src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/commands.rs)
+  (`check_spec_type_support`),
+  [`web-app/src/routes/settings/providers/$providerName.tsx`](web-app/src/routes/settings/providers/$providerName.tsx)
+  (`handleToggleLlamacppDflash` backend-support toast),
+  [`extensions/llamacpp-upstream-extension/src/dflashRegistry.ts`](extensions/llamacpp-upstream-extension/src/dflashRegistry.ts)
+  (model-level registry),
+  [`Makefile`](Makefile) (clean macOS resource extraction),
+  [`src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/backend.rs`](src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/backend.rs)
+  (bundled/installed executable version validation and repair).
+
+### 2026-07-07 — Fall back to the Local API Server's "Current Model" when configuring Launch-page agents against a cloud-provider selection
+- **Context:** A user reported Launch-page agents (Claude Code) failing when
+  their globally selected model was a **cloud** provider (e.g. `gpt-5.4-mini`
+  via OpenRouter/OpenAI) even though the Local API Server panel correctly
+  showed that model as the "Current Model" being served at
+  `http://127.0.0.1:1337/v1`. `app.log` showed
+  `Claude Code configured: base_url=http://127.0.0.1:1337, model=None`.
+  Root cause traced to
+  [`web-app/src/routes/launch/index.tsx`](web-app/src/routes/launch/index.tsx):
+  `activeModel` (passed as the `model` arg to every `configure_*` Tauri
+  command, incl. `configure_claude_code` in
+  [`commands.rs`](src-tauri/src/core/system/commands.rs)) was sourced only
+  from `runningModels[0]`, itself populated by
+  `serviceHub.models().getActiveModels()` — a **local-engine-only** query
+  (llamacpp/mlx), which is empty whenever the active model is a remote/cloud
+  provider. With `model=None`, `configure_claude_code` skips writing
+  `ANTHROPIC_MODEL`/tier-alias env vars entirely, so Claude Code falls back
+  to its internal default Anthropic model names, which don't match any
+  locally-configured remote provider at the proxy (`proxy.rs`) → 404s.
+  `claude-code`'s `requiresModel: false` in
+  [`integrations.ts`](web-app/src/constants/integrations.ts) meant the UI
+  never forced a model pick to mask this gap.
+- **Decision:** Add a fallback in `launch/index.tsx`: when no local engine
+  model is running, use `defaultModelLocalApiServer?.model` from
+  [`useLocalApiServer`](web-app/src/hooks/useLocalApiServer.ts) — the same
+  value the Local API Server panel's "Current Model" row displays, kept in
+  sync with the global model/provider selection via `syncModelSelection`
+  in [`switchModel.ts`](web-app/src/utils/switchModel.ts) regardless of
+  whether the selection is local or cloud. `activeModel` becomes
+  `runningModels[0] ?? defaultModelLocalApiServer?.model ?? null`.
+- **Consequences:** Launching/configuring an agent while a cloud model is
+  selected now passes that model's id to `configure_*`, so Claude Code (and
+  any other agent reading the `model` param) gets pinned to exactly what
+  "Current Model" advertises, matching what the proxy will actually route.
+  No IPC, schema, or on-disk-layout change — a one-line data-source swap in
+  a single web-app file. Local-model launches are unaffected (still take
+  the `runningModels[0]` branch first). **Verified:** `tsc -b` clean;
+  `ReadLints` clean on the edited file.
+- **Owner:** team.
+- **Links:** the 2026-06-01 ADR *Add a "Launch" page …* (the agent
+  install/configure flow this fixes), files:
+  [`web-app/src/routes/launch/index.tsx`](web-app/src/routes/launch/index.tsx)
+  (`activeModel`),
+  [`web-app/src/hooks/useLocalApiServer.ts`](web-app/src/hooks/useLocalApiServer.ts)
+  (`defaultModelLocalApiServer`),
+  [`web-app/src/utils/switchModel.ts`](web-app/src/utils/switchModel.ts)
+  (`syncModelSelection`).
+
+### 2026-07-07 — Make llama-server readiness detection version-independent (log-line broadening + `/health` HTTP poll) in both `llamacpp-upstream` and `llamacpp` (turboquant) plugins
+- **Context:** Users on recent `llama-server` builds (e.g. macOS on `b9702`+)
+  reported the model load hanging indefinitely at "Starting Server", even
+  though the attached `app.log` showed `llama-server` itself starting
+  successfully and serving requests. Root-caused to upstream
+  `ggml-org/llama.cpp` commit `27c8bb4f6` (first released in `b9829`),
+  which reworded the server-ready log line — dropping "server is" from
+  "server is listening on ..." down to a bare "listening on ...". Both
+  `load_llama_model_impl` implementations
+  ([`tauri-plugin-llamacpp-upstream/src/commands.rs`](src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/commands.rs)
+  and its turboquant twin
+  [`tauri-plugin-llamacpp/src/commands.rs`](src-tauri/plugins/tauri-plugin-llamacpp/src/commands.rs))
+  matched stdout/stderr against a small set of exact substrings
+  (`"server is listening on"`, `"server listening on"`, `"http server
+  listening"`, `"starting the main loop"`, `"all slots are idle"`), so
+  neither task's `ready_tx.send(true)` ever fired once upstream changed the
+  wording — the `tokio::select!` loop looped silently until the 600s
+  `timeout_duration` elapsed. This is a systemic risk: any future upstream
+  log rewording (and the `ggml-org/llama.cpp` PR volume is large — dozens
+  of merges daily) can silently re-break readiness detection again, with no
+  compile-time signal.
+- **Decision:** Two complementary, mutually-reinforcing fixes, applied
+  identically to **both** plugins (upstream is Windows/Linux/macOS's
+  primary provider; turboquant is macOS-only but shares the exact same
+  hazard):
+  1. **Broaden the log-line matcher.** New private helper
+     `is_ready_log_line(line_lower: &str) -> bool` matches the stable
+     substring `"listening on"` (present in every historical wording:
+     "server is listening on", "server listening on", "router server is
+     listening on", and the current bare "listening on"), plus the existing
+     `"all slots are idle"` / `"starting the main loop"` / `"http server
+     listening"` checks. Both the stdout task and the stderr task now call
+     this single helper instead of duplicating an inline substring list —
+     one place to extend if upstream reworks phrasing again.
+  2. **Add a version-independent `/health` HTTP poll as the primary
+     readiness signal.** A new `tokio::spawn`ed `health_task` polls
+     `http://127.0.0.1:{port}/health` every 200ms (500ms per-request
+     timeout via `reqwest::Client::builder()`, already a dependency in both
+     plugins' `Cargo.toml`). Per upstream's own `server-http.cpp` /
+     `server-context.cpp` (`middleware_server_state` + `get_health`),
+     `/health` is a stable contract across every llama.cpp version we've
+     observed: HTTP 503 with a JSON error body while the model is loading,
+     HTTP 200 `{"status":"ok"}` once ready — no log-wording dependency at
+     all. `ready_tx` is `.clone()`d three ways (`stdout_ready_tx`,
+     `stderr_ready_tx`, `health_ready_tx`) so all three tasks can signal
+     readiness independently into the same `mpsc` channel without fighting
+     over ownership. `health_task.abort()` is called at every loop exit
+     point (early-exit-with-error, ready-signal-received, process-exited-
+     during-wait, timeout) so the poller never leaks past the function's
+     lifetime.
+- **Consequences:** Readiness detection now survives future upstream log
+  rewording by design — even if every log-based matcher in
+  `is_ready_log_line` goes stale again, the `/health` poll independently
+  confirms readiness within ~200ms of the server actually being able to
+  serve requests, so the previous "hang for 600s then fail" failure mode
+  degrades at worst to "detect readiness ~200ms slower than the log line
+  would have." Log-based detection is kept (not removed) as a fast,
+  zero-latency complement — most loads still resolve on log lines
+  microseconds after the process prints them, well before the poll's next
+  200ms tick fires. No IPC, settings-schema, or on-disk-layout change;
+  scope is confined to the readiness-wait block inside
+  `load_llama_model_impl` in both plugins. **Verified:** `cargo check -p
+  tauri-plugin-llamacpp-upstream -p tauri-plugin-llamacpp` and `cargo check
+  -p Atomic-Chat` both clean (0 errors, only pre-existing dead_code
+  warnings); `cargo test` green in both plugins (143 passed in upstream, 124
+  in turboquant — no regressions, no new tests added since the change is
+  integration-level and requires a live `llama-server` process to exercise
+  meaningfully); `ReadLints` clean on both edited files.
+- **Owner:** team.
+- **Links:** [ggml-org/llama.cpp commit 27c8bb4f6](https://github.com/ggml-org/llama.cpp/commit/27c8bb4f63ad9f20bf5901067810a4be5ffe20c4)
+  (the log-wording change that triggered this), `b9829` (first release
+  carrying it), §4.2 *LLM backend*, files:
+  [`src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/commands.rs`](src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/commands.rs)
+  (`is_ready_log_line`, `load_llama_model_impl` health-check poller),
+  [`src-tauri/plugins/tauri-plugin-llamacpp/src/commands.rs`](src-tauri/plugins/tauri-plugin-llamacpp/src/commands.rs)
+  (mirrored), upstream `tools/server/server-http.cpp`
+  (`middleware_server_state`) and `tools/server/server-context.cpp`
+  (`get_health`) in `AtomicBot-ai/atomic-llama-cpp-turboquant`.
+
+---
+
+### 2026-07-01 — Fix Hermes Agent config on Windows writing to the wrong file (`%USERPROFILE%\.hermes` vs the installer's real `HERMES_HOME`), plus a stale-registry-env guard
+- **Context:** A Windows user reported that changing the model in Settings →
+  Hermes Agent had no effect — the `hermes` CLI kept using its old model.
+  Root-caused via two focused subagent investigations (codebase patterns +
+  Hermes installer mechanics), confirmed against the upstream
+  `NousResearch/hermes-agent` `install.ps1` and Python source:
+  1. **Wrong file, unconditionally.** `configure_hermes_agent` /
+     `clear_hermes_agent_config`
+     ([`commands.rs`](src-tauri/src/core/system/commands.rs)) always wrote to
+     `%USERPROFILE%\.hermes\config.yaml`. But the official Windows installer
+     (`install.ps1`) sets `HERMES_HOME` to `%LOCALAPPDATA%\hermes` via
+     `[Environment]::SetEnvironmentVariable("HERMES_HOME", ..., "User")` and
+     seeds a template `config.yaml` there — even with `-SkipSetup
+     -NonInteractive` (those flags only skip the interactive API-key/model
+     wizard, not the `HERMES_HOME` env-var setup or directory scaffolding).
+     Hermes' own `hermes_constants.py::get_hermes_home()` resolves
+     `os.environ["HERMES_HOME"]` first, then falls back to
+     `%LOCALAPPDATA%\hermes` — **never** `%USERPROFILE%\.hermes`, which isn't
+     a Hermes default on any platform. So our app was patching a file the
+     `hermes` CLI never reads.
+  2. **Stale env var, same-session.** Even a naive `std::env::var("HERMES_HOME")`
+     read would be unreliable: the Launch page's Run flow calls
+     `install_agent` (spawns `install.ps1`, which writes `HERMES_HOME` to
+     `HKCU\Environment`) and `configure_hermes_agent` back-to-back in the
+     *same* already-running Tauri process, whose environment block is a
+     snapshot taken at its own startup — registry writes from a child
+     installer never propagate back into it. (Hermes' own official Electron
+     desktop app hit and fixed this exact gap by reading the registry
+     directly — precedent confirmed in
+     `apps/desktop/electron/windows-user-env.cjs`.)
+- **Decision:** New `resolve_hermes_dir()` helper
+  ([`commands.rs`](src-tauri/src/core/system/commands.rs)), used by both
+  `configure_hermes_agent` and `clear_hermes_agent_config`, replacing the
+  hardcoded `USERPROFILE\.hermes` / `HOME/.hermes` split. On Windows it tries,
+  in order: (1) a **fresh** registry read of `HERMES_HOME` via new
+  `#[cfg(windows)] read_windows_user_env(name)` (spawns
+  `powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('HERMES_HOME', 'User')"`,
+  `CREATE_NO_WINDOW`, mirroring the existing `refresh_windows_path::read_scope`
+  PATH-refresh pattern rather than adding a new `winreg`-based path — the
+  crate is already a dependency but this keeps the read symmetric with the
+  proven PATH mechanism); (2) the process's own (possibly stale but
+  non-worse) `HERMES_HOME` env var, in case a previous launch already picked
+  it up; (3) `%LOCALAPPDATA%\hermes` — Hermes' genuine platform default. Off
+  Windows, behavior is unchanged (`$HOME/.hermes`).
+- **Consequences:** Model/base-URL/provider changes made in Settings → Hermes
+  Agent (and the Launch-page one-click Run flow) now land in the file the
+  `hermes` CLI actually reads, on both a fresh install (installer just ran,
+  same session) and a pre-existing install. No IPC, schema, or on-disk-layout
+  change beyond which directory is targeted; macOS/Linux (`$HOME/.hermes`)
+  are untouched. **Deliberately not done:** no generic reusable
+  "read any Windows user env var" abstraction beyond this one function (the
+  existing `refresh_windows_path` remains PATH-specific and unchanged); no
+  `winreg`-crate-based read was introduced (the PowerShell approach mirrors
+  the already-proven pattern one function above it). **Verified:**
+  `cargo check -p Atomic-Chat` clean (0 errors, only the pre-existing
+  unrelated `FileMetadata` dead_code warning in `tauri-plugin-vector-db`);
+  `ReadLints` clean on the edited file. A live Windows smoke test (install
+  Hermes fresh -> change model in Settings -> confirm `hermes` picks it up)
+  is the residual manual step (no such host in the sandbox).
+- **Owner:** team.
+- **Links:** the 2026-06-01 ADR *Add a "Launch" page ...* (the
+  `configure_hermes_agent` / `install_agent` sequencing this fix corrects
+  for), the 2026-06-29/2026-06-25 ADRs on Windows PATH refresh (the
+  `read_scope` / `refresh_windows_path` pattern reused here), files:
+  [`src-tauri/src/core/system/commands.rs`](src-tauri/src/core/system/commands.rs)
+  (`resolve_hermes_dir`, `read_windows_user_env`, `configure_hermes_agent`,
+  `clear_hermes_agent_config`),
+  [`web-app/src/routes/settings/hermes-agent.tsx`](web-app/src/routes/settings/hermes-agent.tsx).
+
+### 2026-07-01 — Fix `llamacpp-upstream` hot-swap race: persist `version_backend` *before* unloading, not after (Windows "optimal backend selected but still running on CPU" bug)
+- **Context:** Windows user report — after "Find optimal backend" downloads
+  and applies a GPU backend onto a host that was already running a loaded
+  model on the bundled CPU build, the Settings UI immediately shows the new
+  backend as active, but the running `llama-server.exe` process silently
+  stays on the **old** CPU build (no crash, no error — just wrong binary,
+  confirmed by throughput staying CPU-bound). Root cause is a hot-swap
+  ordering race in `applyBackendLive()`
+  ([`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts)),
+  the private helper `downloadRecommendedBackend()` calls after a successful
+  download to apply the new backend without a full app restart. The old
+  order was: (1) `getLoadedModels()` → (2) `unload()` every loaded model →
+  (3) `updateBackend()` (persists settings + commits
+  `this.config.version_backend` to the new string). Step (2)'s `unload()`
+  flips the model's server status to stopped, which the web-app's
+  local-model auto-start effect
+  ([`ChatInput.tsx`](web-app/src/containers/ChatInput.tsx), the
+  `ensureLocalModelRunning` effect) reacts to *immediately* by calling
+  `switchToModel()` → `performLoad()`. `performLoad()` reads
+  `cfg.version_backend` off a synchronous snapshot of `this.config` taken at
+  call time — so if that auto-reload fires before step (3) commits (a race
+  window Windows widens with the deliberate ~1s delay inside
+  `updateBackend()`), the auto-reload spawns a fresh `llama-server.exe`
+  against the **still-old** `version_backend`, then `updateBackend()`
+  finishes a moment later and flips the UI/config to the new value — leaving
+  the UI and the actually-running process permanently out of sync until the
+  next manual restart. Confirmed the Rust-side process-termination path
+  (`unload_llama_model` / `force_terminate_process` / `find_session_by_model_id`
+  in `tauri-plugin-llamacpp-upstream`) is not at fault — termination is
+  reliable; this is purely a TS-side config-commit-vs-reload ordering bug.
+- **Decision (scope: `llamacpp-upstream-extension` only — the user
+  explicitly declined mirroring it into the turboquant `llamacpp-extension`,
+  which carries the byte-identical pattern but is macOS-only and not the
+  reported bug):** Reorder `applyBackendLive()` so `updateBackend()` commits
+  the new `version_backend` into `this.config` **before** any loaded model is
+  unloaded: (1) `getLoadedModels()` (best-effort, unchanged) → (2)
+  `updateBackend(backendString)`, now throwing early (and touching **no**
+  loaded model) if `wasUpdated` is false → (3) unload each previously-loaded
+  model (best-effort, log-and-continue, unchanged). Any auto-reload the
+  unload step triggers now reads the already-committed new backend. A
+  `updateBackend()` failure is also now strictly safer than before — a
+  working session is never killed on a failed hot-swap attempt, whereas the
+  old order unloaded first and could fail on the update, stranding the user
+  model-less until `activatePendingBackend()` retried on next launch.
+- **Consequences:** Windows (and any other platform driving
+  `llamacpp-upstream`) users who hot-swap onto a better backend while a
+  model is loaded now actually run on the new backend the moment the UI
+  reports it, closing the "optimal backend selected but silently still on
+  CPU" gap. **Deliberately NOT mirrored into `extensions/llamacpp-extension/`
+  (the TurboQuant provider, macOS-only)** — it has the identical
+  unload-then-update ordering in its own `applyBackendLive()` and is
+  logically exposed to the same race, but is out of scope for this fix per
+  explicit user decision; a future ADR should port this reorder there if the
+  same symptom is ever reported on macOS TurboQuant. No IPC, Rust,
+  settings-schema, or on-disk-layout change — pure reorder inside one
+  extension method. **Verified:** rolldown build clean
+  (`dist/index.js` 240.63 kB, exit 0 — the authoritative compile);
+  `ReadLints` clean on the edited file.
+- **Owner:** team.
+- **Links:** §4.2 *LLM backend*, the 2026-06-15/16 ADRs on
+  `llamacpp-upstream` backend fallback/recovery (the broader hot-swap /
+  fallback machinery this method belongs to), files:
+  [`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts)
+  (`applyBackendLive`, `downloadRecommendedBackend`, `updateBackend`),
+  [`web-app/src/containers/ChatInput.tsx`](web-app/src/containers/ChatInput.tsx)
+  (the local-model auto-start effect that triggered the race).
+
+---
+
+### 2026-06-29 — Auto-install Node.js/npm via `winget` when an npm-based Launch-page agent is installed on a Windows host without npm (graceful fallback to the nodejs.org error)
+- **Context:** `install_agent`
+ ([`commands.rs`](src-tauri/src/core/system/commands.rs)) gates every
+ Launch-page agent install on its prerequisite binary
+ (`agent_install_spec` → `prereq`: `npm` for Claude Code / Codex / OpenCode /
+ OpenClaw / Cline / MiMo / Pi / Kilo, `curl` for Goose/Hermes, etc.). When
+ the prereq was missing it returned an actionable-but-manual error
+ ("Install Node.js from https://nodejs.org, then restart Atomic Chat"). So a
+ fresh Windows machine with no Node couldn't one-click-install any npm-based
+ agent — the user had to leave the app, install Node, restart, and retry.
+- **Decision (per the user-chosen options — `winget`, **Windows-only**,
+ **graceful** fallback; no IPC/schema/contract change):** Before giving up on
+ a missing **npm** prereq, attempt to auto-install Node.js LTS (which bundles
+ npm) via the Windows Package Manager. New `#[cfg(windows)]`
+ `try_bootstrap_npm_via_winget(app_handle, event, proxy)` (a `#[cfg(not(windows))]`
+ twin returns `false`): (1) probes `winget` itself via the existing
+ `detect_agent_installed` (App Installer ships on Win10 1809+ mainline but not
+ LTSC/Server/stripped images); (2) spawns
+ `winget install --id OpenJS.NodeJS.LTS -e --silent --accept-package-agreements
+ --accept-source-agreements` with `CREATE_NO_WINDOW`, `apply_runtime_path` (the
+ registry+npm-prefix PATH refresh from the same-day ADR below) and
+ `apply_proxy_env`, streaming stdout/stderr to the **same**
+ `agent_install_log:<id>` event the agent installer uses so the UI shows
+ progress; (3) re-checks `npm` via `detect_agent_installed` (which re-reads the
+ registry PATH at runtime, so the freshly-installed npm resolves without an app
+ restart). The `install_agent` prereq block now defines `event` up front, and
+ when the prereq is missing it tries the bootstrap **only when `prereq == "npm"`**
+ and only on a successful re-detect continues; otherwise it returns the
+ unchanged actionable nodejs.org error. `ProxyEnv` already derives `Clone`, so
+ the proxy is passed to both the bootstrap and the later install closure.
+- **Consequences:** On Windows, installing an npm-based agent on a Node-less
+ machine now silently bootstraps Node.js LTS via winget (one UAC prompt from
+ winget itself) and proceeds — the Launch flow works end-to-end from the
+ packaged app. When winget is absent, the install fails, or npm still isn't
+ found, it degrades to the existing manual-install error (no behaviour change
+ for that path). **Deliberately NOT done (out of scope):** the MSI-from-nodejs.org
+ and bundled-portable-Node-sidecar alternatives (heavier: own download/verify +
+ UAC, or +~50-90 MB installer + a new build-pipeline branch); auto-installing
+ the `curl`/`powershell` prereqs (non-npm agents are unaffected); any
+ macOS/Linux auto-install (their npm-missing path keeps the manual error per the
+ chosen Windows-only scope). **Verified:** `cargo check -p Atomic-Chat` clean
+ (exit 0; only pre-existing unrelated `dead_code` / `unused_mut` /
+ `non_snake_case` warnings in the mlx / llamacpp / hardware / vector-db plugins).
+ A live Windows smoke test (Node-less host → install an npm agent → winget
+ bootstraps Node → agent installs) is the residual manual step (no such host in
+ the sandbox).
+- **Owner:** team.
+- **Links:** the same-day ADR *Refresh PATH (+ npm global prefix) for the
+ Launch-page interactive agent terminal …* (the `apply_runtime_path` /
+ `refresh_windows_path` machinery this reuses), the 2026-06-25 ADR *Propagate
+ the app proxy into Launch-page agent installers …*, the 2026-06-01 ADR *Add a
+ "Launch" page …*, files:
+ [`src-tauri/src/core/system/commands.rs`](src-tauri/src/core/system/commands.rs)
+ (`try_bootstrap_npm_via_winget`, `install_agent` prereq block).
+
+---
+
+### 2026-06-29 — Refresh PATH (+ npm global prefix) for the Launch-page interactive agent terminal so npm-installed agent shims resolve on Windows from the packaged app
+- **Context:** On Windows, pressing **Run** on a Launch-page coding agent
+ (Claude Code, Codex, OpenCode, …) opened a `cmd` console that reported
+ `'claude' is not recognized as an internal or external command`, even though
+ the agent's npm-global shim (`claude.cmd`) was installed in `%APPDATA%\npm`.
+ Developers running `yarn dev` from a terminal never saw it (their shell PATH
+ is already complete), but a packaged `.exe` launched from Explorer snapshots
+ PATH once at startup via `fix_path_env::fix()` — so Node/npm installed (or
+ `%APPDATA%\npm` broadcast to the user PATH) after first launch stayed
+ invisible to spawned subprocesses. Root cause was an **asymmetry** in
+ [`open_agent_terminal`](src-tauri/src/core/system/commands.rs): the
+ `detect_agent_installed` (`detect_on_native_path`) and `install_agent` paths
+ already call `apply_login_path` + `apply_runtime_path` (the 2026-06-25 ADR's
+ `refresh_windows_path` registry refresh), but the Windows branch of
+ `open_agent_terminal` spawned `cmd /C start "" cmd /K <agent>` with **no**
+ PATH refresh — the launched console inherited only the stale startup
+ snapshot. Compounding it, even a refreshed registry PATH can legitimately
+ lack `%APPDATA%\npm` if the user PATH entry hadn't been broadcast yet, and
+ that dir is exactly where `install_agent`'s own `npm i -g` lands.
+- **Decision (two minimal, complementary fixes; no IPC/schema/contract change):**
+ 1. **Single source of truth — `refresh_windows_path()` now always includes
+ the npm global prefix.** It computes `%APPDATA%\npm` (the default npm global
+ bin dir on Windows, where global shims live) and folds it into the merged,
+ de-duplicated machine→user→npm→live PATH. The early `None` guard is relaxed
+ to also consider the npm dir, so the function can still contribute it even
+ if both registry-scope reads fail. Because all three spawn sites (detect /
+ install / terminal) flow through `apply_runtime_path` →
+ `refresh_windows_path`, every one of them now resolves npm-installed agents
+ regardless of whether the registry PATH carries `%APPDATA%\npm`. Cheap (an
+ env-var join, no `npm prefix -g` process spawn — keeps the per-agent detect
+ probe fast); a non-existent dir is a harmless PATH entry.
+ 2. **`open_agent_terminal` applies the refreshed PATH.** The Windows branch
+ calls `apply_runtime_path(&mut cmd)` on the outer `cmd` before spawn (the
+ launched console inherits this env, exactly like the existing proxy-env
+ propagation). For symmetry, the Linux branch now also calls
+ `apply_login_path` + `apply_runtime_path` (the macOS branch returns early
+ and is unaffected; `bash -lc` there already resolves PATH, so it's belt-and-
+ suspenders, mirroring detect/install).
+- **Consequences:** A freshly-installed (or registry-only) npm agent shim now
+ resolves in the Run terminal without an app restart, so the Launch flow works
+ for Windows users from the packaged app. **Deliberately NOT done (out of
+ scope):** querying the actual `npm prefix -g` for a *custom* npm prefix (rare;
+ the `%APPDATA%\npm` default — also where our own `install_agent` writes —
+ covers the overwhelming majority, and spawning npm on every detect probe
+ would add latency); no change to the proxy-propagation or iGPU-gate logic of
+ the 2026-06-25 ADR. **Verified:** `cargo check -p Atomic-Chat` clean (exit 0;
+ only pre-existing unrelated `dead_code` / `unused_mut` / `non_snake_case`
+ warnings in the mlx / llamacpp / hardware / vector-db plugins). A live
+ Windows packaged-build smoke test (install Node after first launch → Run →
+ agent resolves) is the residual manual step (no such host in the sandbox).
+- **Owner:** team.
+- **Links:** the 2026-06-25 ADR *Propagate the app proxy into Launch-page agent
+ installers, refresh the Windows PATH at install/detect time …* (the
+ `refresh_windows_path` / `apply_runtime_path` machinery this extends), the
+ 2026-06-04 ADR *Resolve the login-shell PATH for Launch-page agent
+ detection/install*, the 2026-06-01 ADR *Add a "Launch" page …*, files:
+ [`src-tauri/src/core/system/commands.rs`](src-tauri/src/core/system/commands.rs)
+ (`refresh_windows_path` npm-prefix inclusion, `open_agent_terminal` Windows +
+ Linux PATH application).
+
+---
+
+### 2026-06-26 — Fix Linux/Vulkan GPU backend 404 → infinite spinner when manifest tag is stale or CDN asset is missing (ATO-233)
+- **Context:** On Linux + Vulkan, model loads hung indefinitely on the spinner.
+ Root cause: the static `atomic-chat-conf/backends/manifest.json` contained tag
+ `b9691` which did not have a live `llama-b9691-bin-ubuntu-vulkan-x64.tar.gz`
+ asset on the ggml-org CDN (404). Four compounding code bugs amplified the
+ outage: (1) `ensureBackendReady` always attempted the stale-tag download before
+ checking whether a compatible backend of the same type was already installed
+ locally at a different tag; (2) `load()` skipped `configureBackends` whenever
+ `version_backend` was a concrete `<tag>/<backend>` string, even when that exact
+ backend was not on disk — so configureBackends had no chance to update the
+ stale pin; (3) `installBackend` ("Install Backend from File") stored backends
+ under the raw ggml-org asset name (`ubuntu-vulkan-x64`) instead of the internal
+ id (`linux-vulkan-x64`), so `findCompatibleInstalledBackend('linux-vulkan-x64')`
+ could not find manually-installed backends; (4) `map_old_backend_to_new` had no
+ mapping for `ubuntu-*` names, so the naming mismatch propagated to all callers
+ that used the normalization function. The `reqwest` client in `_get_file_size`
+ also lacked a connection timeout, allowing a hung CDN endpoint to hold the load
+ promise open indefinitely.
+- **Decision (four minimal, independent fixes):**
+ 1. **`ensureBackendReady` local-first pre-flight** (most impactful, ATO-233
+ primary fix). On the load path (`allowFallback=true`), before attempting any
+ network download, check if a compatible backend of the same type is already
+ installed locally at a different tag via `findCompatibleInstalledBackend`.
+ If found, persist the local version as the new `version_backend` and return
+ immediately — eliminates the stale-tag 404 entirely when a working local copy
+ exists.
+ 2. **`load()` awaits configureBackends when backend is not installed.** In
+ `load()`, the existing "skip wait when concrete" shortcut now has an exception:
+ if the concrete `version_backend` is not locally installed (`isBackendInstalled`
+ returns false), we still await `configureBackendsPromise`. This lets
+ configureBackends finish and potentially update `version_backend` to an
+ installed backend before the load races ahead with a stale tag.
+ 3. **`installBackend` normalizes `ubuntu-*` → `linux-*`** on Linux. When the
+ archive filename is `llama-bXXXX-bin-ubuntu-vulkan-x64.tar.gz` (ggml-org
+ upstream naming), the extracted backend is now stored under `linux-vulkan-x64`
+ (the internal id). Future "Install Backend from File" installs will be found
+ by `findCompatibleInstalledBackend` and the rest of the backend machinery.
+ 4. **`map_old_backend_to_new` (Rust) maps `ubuntu-*` → `linux-*`** so that
+ any existing on-disk backend stored under the old ubuntu name is normalized
+ to the corresponding `linux-*` id whenever it passes through the mapping
+ function (e.g., in `find_latest_version_for_backend`, stored-type comparisons,
+ etc.). **`findCompatibleInstalledBackend` (TS)** extended with an
+ `ubuntu-*` ↔ `linux-*` equivalence set so it can find manually-installed
+ backends regardless of which naming generation they used.
+ 5. **`_get_client_for_item` + `_get_file_size` timeouts** (defense-in-depth).
+ Added `connect_timeout(30s)` to the reqwest client builder and a per-request
+ `.timeout(30s)` on the HEAD request in `_get_file_size`, capping the
+ worst-case hang from a non-responsive CDN endpoint.
+- **Consequences:** On Linux with a stale manifest tag: if the user has any
+ `linux-vulkan-x64` backend already installed (from a previous "Find optimal
+ backend" or "Install from File" run), the model load now uses it immediately
+ without a network round-trip. If no Vulkan backend is installed, the load still
+ falls through to Tier 3 (CPU fallback) after at most 30 seconds instead of
+ potentially forever. Future "Install from File" installs with ggml-org ubuntu
+ names are stored under the correct internal id. **Deliberately NOT done:** the
+ manifest update itself (a separate data-only change in `atomic-chat-conf` to
+ bump `b9691` → a tag that actually has the ubuntu-vulkan-x64 asset); that is
+ tracked as a follow-up data fix. **Verified:** rolldown build clean
+ (`dist/index.js` 216.79 kB, exit 0 — the authoritative compile); Rust backend
+ tests not runnable in the sandbox (Cargo 1.83 is below the dependency floor of
+ some new transitive deps), consistent with prior ADRs; `eslint` runs on
+ web-app without new errors; all logic verified by code-level inspection.
+- **Owner:** team.
+- **Links:** [ATO-233](https://linear.app/atomicchat/issue/ATO-233), the
+ 2026-06-17 ADR *Resolve the `llamacpp-upstream` backend index from a static
+ manifest* (ATO-199; the manifest-channel this fix builds on), the 2026-06-16
+ ADRs *Tiered graceful backend fallback* (ATO-178/179; the resolveBackendFallback
+ tiers that this pre-flight sits in front of), files:
+ [`extensions/llamacpp-upstream-extension/src/index.ts`](extensions/llamacpp-upstream-extension/src/index.ts)
+ (`ensureBackendReady` local-first pre-flight, `load()` configureBackends wait,
+ `installBackend` ubuntu→linux normalization),
+ [`extensions/llamacpp-upstream-extension/src/backend.ts`](extensions/llamacpp-upstream-extension/src/backend.ts)
+ (`backendTypeEquivalents`, `findCompatibleInstalledBackend`),
+ [`src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/backend.rs`](src-tauri/plugins/tauri-plugin-llamacpp-upstream/src/backend.rs)
+ (`map_old_backend_to_new` ubuntu-* handling),
+ [`src-tauri/src/core/downloads/helpers.rs`](src-tauri/src/core/downloads/helpers.rs)
+ (`_get_client_for_item` connect_timeout, `_get_file_size` per-request timeout).
+
+---
 
 ### 2026-06-25 — Propagate the app proxy into Launch-page agent installers, refresh the Windows PATH at install/detect time, and stop "Find optimal backend" picking Vulkan on integrated-only iGPUs
 - **Context:** Three Windows-confirmed defects from a user log + screenshots.

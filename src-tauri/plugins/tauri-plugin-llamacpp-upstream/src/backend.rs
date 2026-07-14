@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use tauri::{Manager, Runtime};
 
 #[tauri::command]
@@ -16,6 +17,25 @@ pub fn map_old_backend_to_new(old_backend: String) -> String {
     // upstream. It maps any historical Windows backend id to its closest
     // ggml-org equivalent so old settings still resolve to something we can
     // actually download.
+
+    // ggml-org Ubuntu Linux asset names (ubuntu-*) are produced when users
+    // install backends via "Install Backend from File" using the upstream
+    // ggml-org tarball filename (e.g. llama-bXXXX-bin-ubuntu-vulkan-x64.tar.gz).
+    // Map them to the internal linux-* ids used throughout this extension so
+    // they are recognised by findCompatibleInstalledBackend and the rest of
+    // the backend machinery (ATO-233).
+    if old_backend.starts_with("ubuntu-") {
+        let arch_suffix = if old_backend.contains("-arm64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        if old_backend.contains("vulkan") {
+            return format!("linux-vulkan-{}", arch_suffix);
+        }
+        return format!("linux-cpu-{}", arch_suffix);
+    }
+
     let is_windows = old_backend.starts_with("win-");
     let is_linux = old_backend.starts_with("linux-");
     let os_prefix = if is_windows {
@@ -215,6 +235,57 @@ fn is_backend_installed(backend_dir: &PathBuf) -> bool {
     // Otherwise check root directory (llama-server)
     let root_path = backend_dir.join(exe_name);
     root_path.exists()
+}
+
+fn backend_executable_path(backend_dir: &PathBuf) -> PathBuf {
+    let exe_name = if cfg!(target_os = "windows") {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+    let build_path = backend_dir.join("build").join("bin").join(exe_name);
+    if build_path.exists() {
+        build_path
+    } else {
+        backend_dir.join(exe_name)
+    }
+}
+
+fn parse_binary_version(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("version:")
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+    })
+}
+
+fn backend_binary_matches_version(backend_dir: &PathBuf, expected_version: &str) -> bool {
+    let expected = parse_backend_version(expected_version.to_string());
+    if expected == 0 {
+        return true;
+    }
+
+    let output = match Command::new(backend_executable_path(backend_dir))
+        .arg("--version")
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            log::warn!(
+                "Failed to inspect bundled backend version for {}: {}",
+                backend_dir.display(),
+                error
+            );
+            return false;
+        }
+    };
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_binary_version(&combined) == Some(expected)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1132,19 +1203,38 @@ pub async fn install_bundled_backend<R: Runtime>(
         return not_bundled;
     }
 
+    if !backend_binary_matches_version(&resource_dir, &version) {
+        log::warn!(
+            "[install_bundled_backend] Bundled binary does not match declared version {}; refusing mislabeled resource",
+            version
+        );
+        return not_bundled;
+    }
+
     let target_dir = PathBuf::from(&backends_dir).join(&version).join(&backend);
 
     if is_backend_installed(&target_dir) {
-        log::info!(
-            "[install_bundled_backend] Bundled backend already installed: {}/{}",
-            version, backend
+        if backend_binary_matches_version(&target_dir, &version) {
+            log::info!(
+                "[install_bundled_backend] Bundled backend already installed: {}/{}",
+                version, backend
+            );
+            return Ok(BundledBackendResult {
+                installed: true,
+                backend_string: Some(format!("{}/{}", version, backend)),
+                version: Some(version),
+                backend: Some(backend),
+            });
+        }
+
+        log::warn!(
+            "[install_bundled_backend] Replacing mislabeled backend at {} with bundled {}/{}",
+            target_dir.display(),
+            version,
+            backend
         );
-        return Ok(BundledBackendResult {
-            installed: true,
-            backend_string: Some(format!("{}/{}", version, backend)),
-            version: Some(version),
-            backend: Some(backend),
-        });
+        fs::remove_dir_all(&target_dir)
+            .map_err(|e| format!("remove stale backend {}: {}", target_dir.display(), e))?;
     }
 
     log::info!(
@@ -1184,6 +1274,65 @@ pub async fn install_bundled_backend<R: Runtime>(
         version: Some(version),
         backend: Some(backend),
     })
+}
+
+// ----------------------- Manifest HTTP/1.1 fetch -----------------------------
+
+/// Fetch the backend-index manifest from `url` using a reqwest client that is
+/// **forced to HTTP/1.1** (`http1_only`).
+///
+/// # Why this exists
+/// The manifest is hosted on raw.githubusercontent.com, which sits behind the
+/// Fastly CDN.  When reqwest negotiates HTTP/2 over TLS against Fastly on
+/// Linux (native-TLS + OpenSSL) the h2 SETTINGS frame can stall indefinitely
+/// (the socket is open but the response stream never arrives). This is a
+/// known reqwest / Fastly incompatibility on some Linux hosts.
+///
+/// Forcing HTTP/1.1 (`http1_only = true`) entirely avoids the h2 negotiation
+/// and lets the connection proceed over a plain keep-alive TCP stream, which
+/// reliably succeeds on the affected Linux hosts.
+///
+/// The function is gated to desktop targets because reqwest is only listed
+/// as a non-mobile dependency in Cargo.toml.
+#[tauri::command]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub async fn fetch_manifest_http1(url: String, timeout_ms: u64) -> Result<String, String> {
+    use std::time::Duration;
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .connect_timeout(Duration::from_millis(timeout_ms))
+        .timeout(Duration::from_millis(timeout_ms))
+        .user_agent("atomic-chat")
+        .build()
+        .map_err(|e| format!("build reqwest client: {e}"))?;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("fetch {url}: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "fetch {url}: HTTP {}",
+            resp.status().as_u16()
+        ));
+    }
+
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("read response body from {url}: {e}"))?;
+
+    Ok(body)
+}
+
+/// Stub for mobile targets where reqwest is not available.
+#[tauri::command]
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub async fn fetch_manifest_http1(url: String, _timeout_ms: u64) -> Result<String, String> {
+    Err(format!("fetch_manifest_http1 not available on mobile (url: {url})"))
 }
 
 // ---------------------------- Tests ------------------------------------------
@@ -1690,6 +1839,20 @@ mod tests {
         // Note: "v1.0.0" would fail to parse as u32 due to dots, returning 0
         assert_eq!(parse_backend_version("v1.0.0".to_string()), 0);
     }
+
+    #[test]
+    fn test_parse_binary_version() {
+        assert_eq!(
+            parse_binary_version("version: 9937 (2021515a1)\nbuilt with AppleClang"),
+            Some(9937)
+        );
+        assert_eq!(
+            parse_binary_version("warning\nversion: 9222 (9a532ae4b)\n"),
+            Some(9222)
+        );
+        assert_eq!(parse_binary_version("unknown version"), None);
+    }
+
     // --- Filesystem Integration Tests ---
 
     #[tokio::test]

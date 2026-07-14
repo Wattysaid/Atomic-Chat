@@ -38,6 +38,7 @@ import {
   cleanupIncompleteBackends,
   fetchRemoteBackends,
   friendlyBackendLabel,
+  getBackendArchiveName,
   getBackendDownloadUrl,
   getCudartDownloadUrl,
   getCudartArchiveName,
@@ -52,6 +53,8 @@ import {
   mergeEmbedResponses,
   isConcreteVersionBackend,
   matchesMtpLoadFailure,
+  hasEmbeddedMtp,
+  isMtpCapable,
   isCpuBackend,
   isUnsupportedNoAvxCpu,
   CPU_NO_AVX_ERROR_CODE,
@@ -63,6 +66,17 @@ import {
   gemmaMtpDraftUrl,
   type GemmaMtpDraft,
 } from './gemmaMtpRegistry'
+import {
+  resolveDflashDraft,
+  listDflashDrafts,
+  checkDflashSupport,
+  dflashDraftUrl,
+  type DflashDraft,
+} from './dflashRegistry'
+import {
+  resolveLlama3TemplateOverride,
+  STRICT_SYSTEM_GUARD_SIGNATURE,
+} from './chatTemplateOverrides'
 import { basename } from '@tauri-apps/api/path'
 import { getSystemUsage, getSystemInfo } from './hardware'
 import {
@@ -88,6 +102,7 @@ import {
   getSupportedFeaturesFromRust,
   normalizeFeatures,
   isCudaInstalledFromRust,
+  checkSpecTypeSupport,
 } from '../../../src-tauri/plugins/tauri-plugin-llamacpp-upstream/guest-js/index'
 
 // Error message constant - matches web-app/src/utils/error.ts
@@ -130,6 +145,7 @@ const AUTO_INCREASE_CTX_AT_MAX = 'local_backend://auto_increase_ctx_at_max'
 /// llama.cpp/libmtmd build cannot parse (e.g. Gemma 4 `gemma4a` audio).
 /// On this error we retry the load text-only (without --mmproj).
 const ERR_MULTIMODAL_PROJECTOR_LOAD_FAILED = 'MULTIMODAL_PROJECTOR_LOAD_FAILED'
+const DFLASH_SPEC_TYPE = 'draft-dflash'
 /// ATO-187: the model / mmproj GGUF is missing on disk (an interrupted
 /// download that never produced the final file, a file removed outside the
 /// app, or a stale path). Matches the Rust `ModelFileNotFound` code; the
@@ -147,6 +163,12 @@ const ERR_MODEL_FILE_CORRUPT = 'MODEL_FILE_CORRUPT'
 const MULTIMODAL_DISABLED_FALLBACK =
   'local_backend://multimodal_disabled_fallback'
 
+/// Tauri event emitted by the Rust watcher task when a llama-server child
+/// process (PID tracked in LlamacppState::process_map) that was running a
+/// loaded model exits unexpectedly during generation (ATO-244).
+/// Payload: `{ model_id: string, pid: number, error_code: string, message: string }`.
+const SESSION_DIED_EVENT = 'local_backend://llamacpp_upstream_session_died'
+
 /// MODEL_LOAD_TIMED_OUT (ATO-188): large models on slow / cold storage can take
 /// longer than the configured connection timeout (default 600s) to finish
 /// loading and report "ready", so the load was cut off at 600s with a raw
@@ -163,6 +185,16 @@ function modelLoadReadyTimeoutSecs(configuredTimeoutSecs: number): number {
   const base = Number.isFinite(configured) && configured > 0 ? configured : 600
   return Math.max(base, MODEL_LOAD_READY_TIMEOUT_FLOOR_SECS)
 }
+
+/// Temporary hard pin: every launch forcibly reconciles `version_backend`
+/// to this exact ggml-org tag, preserving the user's backend *type*
+/// (cpu/cuda/vulkan/macos-arm64) but never their *version* — this WILL
+/// downgrade a newer manually-installed backend just as readily as it
+/// upgrades an older one. Mirrors the CI/build pins in `Makefile`
+/// (`LLAMACPP_UPSTREAM_TAG`) and `atomic-chat-conf/backends/manifest.json`
+/// (`tag_name`). Remove (or move to a real settings-driven pin) once the
+/// team is done validating this tag broadly. See `enforcePinnedBackendVersion`.
+const PINNED_BACKEND_TAG = 'b9937'
 
 /**
  * Override the default app.log function to use Jan's logging system.
@@ -386,6 +418,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
   private modelMaxCtxTrain = new Map<string, number>()
   private unlistenValidationStarted?: () => void
   private unlistenAutoIncreaseCtx?: () => void
+  private unlistenSessionDied?: () => void
 
   override async onLoad(): Promise<void> {
     super.onLoad() // Calls registerEngine() from AIEngine
@@ -541,12 +574,33 @@ export default class llamacpp_upstream_extension extends AIEngine {
       }
     )
 
+    // ATO-244: Rust post-load watcher task emits this event when a
+    // llama-server child that was running (model already loaded) exits
+    // unexpectedly during generation (e.g. Vulkan GPU crash / SIGSEGV).
+    // Clean up internal session state so the extension stays consistent.
+    // `DataProvider.tsx` listens to this same Rust-emitted event directly to
+    // show the crash toast — see the doc comment on `handleSessionDied` for
+    // why this handler must NOT re-emit it.
+    this.unlistenSessionDied = await listen<{
+      model_id: string
+      pid: number
+      error_code: string
+      message: string
+    }>(SESSION_DIED_EVENT, (event) => {
+      void this.handleSessionDied(event.payload)
+    })
+
     //* configureBackends может долго качать движок — не await, иначе весь UI ждёт завершения.
     this.configureBackendsPromise = this.configureBackends()
       .catch((err) => {
         //! Раньше отклонённый промис терялся; без лога сложно понять вечный «loading» в настройках.
         logger.error('configureBackends failed:', err)
       })
+      // Runs after every launch resolves a concrete `version_backend`, to
+      // forcibly reconcile it to `PINNED_BACKEND_TAG`. Chained onto the
+      // same promise so callers awaiting `configureBackendsPromise` also
+      // observe the pin before touching the backend.
+      .then(() => this.enforcePinnedBackendVersion())
       .finally(() => {
         this.isInitializing = false
         this.configureBackendsPromise = null
@@ -1313,6 +1367,52 @@ export default class llamacpp_upstream_extension extends AIEngine {
     }
   }
 
+  /**
+   * Forcibly reconciles the active backend to `PINNED_BACKEND_TAG`,
+   * preserving the user's current backend *type* (cpu/cuda/vulkan/
+   * macos-arm64) — never their version. Runs once per launch, after
+   * `configureBackends()` has resolved a concrete `version_backend`.
+   *
+   * This is a hard pin: it downgrades a newer manually-installed backend
+   * just as readily as it upgrades an older one. If the pinned tag has no
+   * asset for the user's current type (e.g. a type removed upstream), the
+   * download/hot-swap fails and is logged, leaving the working backend
+   * untouched rather than bricking the install.
+   */
+  private async enforcePinnedBackendVersion(): Promise<void> {
+    try {
+      const current = stripBom(this.config.version_backend || '')
+      if (!isConcreteVersionBackend(current)) {
+        logger.info(
+          'enforcePinnedBackendVersion: no concrete backend configured yet, skipping'
+        )
+        return
+      }
+
+      const slashIdx = current.indexOf('/')
+      const currentTag = current.slice(0, slashIdx)
+      const currentType = current.slice(slashIdx + 1)
+
+      if (currentTag === PINNED_BACKEND_TAG) {
+        return
+      }
+
+      const target = `${PINNED_BACKEND_TAG}/${currentType}`
+      logger.info(
+        `enforcePinnedBackendVersion: pinning backend '${current}' -> '${target}'`
+      )
+      await this.downloadRecommendedBackend(target)
+      logger.info(
+        `enforcePinnedBackendVersion: backend pinned to '${target}'`
+      )
+    } catch (err) {
+      logger.error(
+        'enforcePinnedBackendVersion: failed to pin backend version (keeping current backend):',
+        err
+      )
+    }
+  }
+
   private async determineBestBackend(
     version_backends: { version: string; backend: string }[]
   ): Promise<string> {
@@ -1875,16 +1975,29 @@ export default class llamacpp_upstream_extension extends AIEngine {
   }
 
   /**
-   * Apply a freshly-downloaded backend to the running process: stop any
-   * loaded llama.cpp models, swap `version_backend` via `updateBackend()`,
-   * clear the pending marker, and notify the UI via a window event.
+   * Apply a freshly-downloaded backend to the running process: swap
+   * `version_backend` via `updateBackend()` first, then stop any loaded
+   * llama.cpp models, clear the pending marker, and notify the UI via a
+   * window event.
+   *
+   * Order matters: `updateBackend()` must commit the new `version_backend`
+   * into `this.config` *before* any model is unloaded. Unloading flips the
+   * model's status to stopped, which the web-app's local-model auto-start
+   * effect (`ChatInput.tsx`) reacts to by immediately reloading it via
+   * `switchToModel()`. `performLoad()` snapshots `this.config` synchronously
+   * at call time, so an unload-before-update ordering let that auto-reload
+   * race ahead of `updateBackend()` and respawn `llama-server` against the
+   * *old* backend — the UI would then report the switch as complete while
+   * the running process silently stayed on the previous (e.g. CPU) build.
    *
    * Failure modes:
+   *   - `updateBackend()` throws → we propagate without touching any loaded
+   *     model, so a failed hot-swap never kills a working session. Caller
+   *     leaves the pending marker in place so `activatePendingBackend()`
+   *     retries on next launch.
    *   - `unload()` throws when a session can't be cleanly stopped → we log
-   *     and continue, because `updateBackend()` only mutates settings and
-   *     does not require an empty session table.
-   *   - `updateBackend()` throws → we propagate. Caller leaves the pending
-   *     marker in place so `activatePendingBackend()` retries on next launch.
+   *     and continue; the new backend is already persisted, so the next
+   *     load (auto or manual) picks it up regardless.
    */
   private async applyBackendLive(backendString: string): Promise<void> {
     let loaded: string[] = []
@@ -1892,6 +2005,13 @@ export default class llamacpp_upstream_extension extends AIEngine {
       loaded = await this.getLoadedModels()
     } catch (err) {
       logger.warn('applyBackendLive: getLoadedModels failed (continuing):', err)
+    }
+
+    const result = await this.updateBackend(backendString)
+    if (!result.wasUpdated) {
+      throw new Error(
+        `updateBackend reported wasUpdated=false for ${backendString}`
+      )
     }
 
     for (const modelId of loaded) {
@@ -1903,13 +2023,6 @@ export default class llamacpp_upstream_extension extends AIEngine {
           err
         )
       }
-    }
-
-    const result = await this.updateBackend(backendString)
-    if (!result.wasUpdated) {
-      throw new Error(
-        `updateBackend reported wasUpdated=false for ${backendString}`
-      )
     }
 
     localStorage.removeItem('llama_cpp_pending_backend')
@@ -2204,6 +2317,9 @@ export default class llamacpp_upstream_extension extends AIEngine {
     if (this.unlistenAutoIncreaseCtx) {
       this.unlistenAutoIncreaseCtx()
     }
+    if (this.unlistenSessionDied) {
+      this.unlistenSessionDied()
+    }
   }
 
   onSettingUpdate<T>(key: string, value: T): void {
@@ -2235,6 +2351,16 @@ export default class llamacpp_upstream_extension extends AIEngine {
         ? stripBom(this.config.version_backend || '')
         : undefined
     this.config[key] = value
+
+    // Mutual exclusivity between DFlash and MTP speculative-decoding modes.
+    // The UI (`$providerName.tsx`) owns persistence of both keys via
+    // writeSetting; this keeps the in-memory config consistent as
+    // defense-in-depth so a stale sibling flag can't survive into performLoad.
+    if (key === 'dflash' && value) {
+      this.config.mtp = false
+    } else if (key === 'mtp' && value) {
+      this.config.dflash = false
+    }
 
     if (key === 'version_backend') {
       const valueStr = value as string
@@ -2843,7 +2969,26 @@ export default class llamacpp_upstream_extension extends AIEngine {
     }
 
     // Include prefix in the backend identifier if present
-    const backendIdentifier = prefix ? `${prefix}${backend}` : backend
+    const rawBackendIdentifier = prefix ? `${prefix}${backend}` : backend
+
+    // ATO-233: normalize ggml-org Ubuntu asset names (ubuntu-*) to the
+    // internal linux-* ids used throughout the extension. ggml-org tarballs
+    // are named `llama-bXXXX-bin-ubuntu-{vulkan,}-x64.tar.gz` on Linux, but
+    // the extension stores backends under `linux-vulkan-x64` / `linux-cpu-x64`
+    // so that findCompatibleInstalledBackend and the rest of the backend
+    // resolution machinery can find them by the correct internal id.
+    const backendIdentifier =
+      IS_LINUX && rawBackendIdentifier.startsWith('ubuntu-')
+        ? rawBackendIdentifier.includes('vulkan')
+          ? `linux-vulkan-${rawBackendIdentifier.includes('arm64') ? 'arm64' : 'x64'}`
+          : `linux-cpu-${rawBackendIdentifier.includes('arm64') ? 'arm64' : 'x64'}`
+        : rawBackendIdentifier
+
+    if (backendIdentifier !== rawBackendIdentifier) {
+      logger.info(
+        `[installBackend] Normalized archive backend name '${rawBackendIdentifier}' → '${backendIdentifier}'`
+      )
+    }
 
     logger.info(
       `Detected prefix: ${prefix || 'none'}, version: ${version}, backend: ${backendIdentifier}`
@@ -3186,6 +3331,38 @@ export default class llamacpp_upstream_extension extends AIEngine {
   }
 
   /**
+   * Whether an installed Qwen GGUF contains an embedded MTP/NextN head.
+   * Capability comes from the canonical GGUF metadata rather than the local
+   * model id, which may be derived from a filename that omits "MTP".
+   */
+  async checkEmbeddedMtpSupport(modelId: string): Promise<boolean> {
+    try {
+      const janDataFolderPath = await getJanDataFolderPath()
+      const modelConfigPath = await joinPath([
+        await this.getModelsRootPath(),
+        modelId,
+        'model.yml',
+      ])
+      const modelConfig = await invoke<ModelConfig>('read_yaml', {
+        path: modelConfigPath,
+      })
+      const modelPath = await joinPath([
+        janDataFolderPath,
+        modelConfig.model_path,
+      ])
+      const gguf = await readGgufMetadata(modelPath)
+      return hasEmbeddedMtp(gguf.metadata)
+    } catch (error) {
+      logger.warn(
+        `Failed to inspect embedded MTP metadata for "${modelId}": ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+      return false
+    }
+  }
+
+  /**
    * Ensure the Gemma 4 MTP draft head GGUF is present next to the target model
    * and recorded in its `model.yml` (`mtp_draft_path`). Mirrors the MLX
    * `ensureDraftDownloaded` flow: idempotent — if the head is already on disk
@@ -3265,6 +3442,145 @@ export default class llamacpp_upstream_extension extends AIEngine {
     const updatedConfig = {
       ...modelConfig,
       mtp_draft_path: relativeDraftPath,
+    } as ModelConfig
+    await invoke<void>('write_yaml', {
+      data: updatedConfig,
+      savePath: configPath,
+    })
+  }
+
+  /**
+   * Whether the given model id is a DFlash-capable target (Qwen3.5-9B,
+   * Qwen3.6-27B, Qwen3.6-35B-A3B). Used by the provider settings UI to decide
+   * between the download path and the unsupported dialog.
+   */
+  async checkDflashSupport(modelId: string): Promise<boolean> {
+    return checkDflashSupport(modelId)
+  }
+
+  /** Available compatible draft quantizations for the selected target model. */
+  async listDflashDrafts(modelId: string): Promise<DflashDraft[]> {
+    return listDflashDrafts(modelId)
+  }
+
+  /**
+   * Whether the selected backend binary can accept
+   * `--spec-type draft-dflash`. This is separate from model-level support so
+   * the UI can explain backend limitations before downloading a draft.
+   */
+  async checkDflashBackendSupport(): Promise<boolean> {
+    const [version, backend] = stripBom(this.config.version_backend || '').split('/')
+    if (!version || !backend || version === 'latest') return false
+    try {
+      const backendPath = await getBackendExePath(backend, version)
+      return await this.backendSupportsDflashSpec(backendPath, {})
+    } catch (e) {
+      logger.warn(
+        `Failed to probe DFlash backend support for ${this.config.version_backend}:`,
+        e
+      )
+      return false
+    }
+  }
+
+  private async backendSupportsDflashSpec(
+    backendPath: string,
+    envs: Record<string, string>
+  ): Promise<boolean> {
+    try {
+      return await checkSpecTypeSupport(backendPath, DFLASH_SPEC_TYPE, envs)
+    } catch (e) {
+      logger.warn(
+        `Failed to probe llama-server support for ${DFLASH_SPEC_TYPE}:`,
+        e
+      )
+      return false
+    }
+  }
+
+  /**
+   * Ensure the DFlash draft GGUF is present next to the target model and
+   * recorded in its `model.yml` (`dflash_draft_path`). Mirrors
+   * `ensureGemmaMtpDraft`: idempotent — if the draft is already on disk and
+   * referenced in `model.yml`, it is a no-op.
+   *
+   * @param modelId A DFlash-capable target model id.
+   * @param quant Draft quantization selected by the user. Defaults to Q8_0.
+   * @throws if the model id is not a DFlash target.
+   */
+  async ensureDflashDraft(modelId: string, quant?: string): Promise<void> {
+    const draft: DflashDraft | null = resolveDflashDraft(modelId, quant)
+    if (!draft) {
+      throw new Error(
+        `Model "${modelId}" does not have a compatible DFlash draft${quant ? ` quantization "${quant}"` : ''}.`
+      )
+    }
+
+    const janDataFolderPath = await getJanDataFolderPath()
+    const modelsRoot = await this.getModelsRootPath()
+    const configPath = await joinPath([modelsRoot, modelId, 'model.yml'])
+    if (!(await fs.existsSync(configPath))) {
+      throw new Error(`Model ${modelId} is not installed`)
+    }
+
+    // Path relative to Jan's data folder (kept relative in model.yml, matching
+    // how `model_path` / `mmproj_path` are stored).
+    const draftSuffix =
+      draft.quant === 'Q4_K_M' ? '' : `-${draft.quant.toLowerCase()}`
+    const relativeDraftPath = `${MODELS_PROVIDER_ROOT}/models/${modelId}/dflash-draft${draftSuffix}.gguf`
+    const absoluteDraftPath = await joinPath([
+      janDataFolderPath,
+      relativeDraftPath,
+    ])
+
+    const modelConfig = await invoke<ModelConfig>('read_yaml', {
+      path: configPath,
+    })
+
+    // Already downloaded + referenced → nothing to do.
+    if (
+      modelConfig.dflash_draft_path === relativeDraftPath &&
+      (await fs.existsSync(absoluteDraftPath))
+    ) {
+      return
+    }
+
+    if (!(await fs.existsSync(absoluteDraftPath))) {
+      const downloadItem: DownloadItem = {
+        url: dflashDraftUrl(draft),
+        save_path: relativeDraftPath,
+        proxy: getProxyConfig(),
+        sha256: draft.draftSha256,
+        size: draft.draftSize,
+        model_id: modelId,
+      }
+      const onProgress = (transferred: number, total: number) => {
+        events.emit(DownloadEvent.onFileDownloadUpdate, {
+          modelId,
+          percent: total > 0 ? transferred / total : 0,
+          size: { transferred, total },
+          downloadType: 'Model',
+        })
+      }
+      const downloadManager = window.core.extensionManager.getByName(
+        '@janhq/download-extension'
+      )
+      await downloadManager.downloadFiles(
+        [downloadItem],
+        this.createDownloadTaskId(`${modelId}-dflash-draft`),
+        onProgress,
+        false
+      )
+      events.emit(DownloadEvent.onFileDownloadAndVerificationSuccess, {
+        modelId,
+        downloadType: 'Model',
+      })
+    }
+
+    // Record the draft in model.yml so `performLoad` can resolve it.
+    const updatedConfig = {
+      ...modelConfig,
+      dflash_draft_path: relativeDraftPath,
     } as ModelConfig
     await invoke<void>('write_yaml', {
       data: updatedConfig,
@@ -3358,9 +3674,28 @@ export default class llamacpp_upstream_extension extends AIEngine {
         )
         await this.configureBackendsPromise
       } else {
-        logger.info(
-          `Backend already configured (${vb}), loading model "${modelId}" without waiting for full backend list`
-        )
+        // ATO-233: also wait when the backend string is concrete but the exe
+        // is NOT locally installed yet. configureBackends may swap version_backend
+        // to an already-installed build (e.g. a bundled CPU backend after an
+        // app update that changed the bundled tag, or after a local compatible
+        // backend was found during startup). Without this check the load
+        // races ahead with a stale tag that is guaranteed to 404, causing the
+        // spinner to hang until resolveBackendFallback finishes.
+        const [vbVer, vbBack] = vb.split('/')
+        const vbIsInstalled =
+          !!vbVer?.trim() &&
+          !!vbBack?.trim() &&
+          (await isBackendInstalled(vbBack.trim(), vbVer.trim()))
+        if (!vbIsInstalled) {
+          logger.info(
+            `Backend ${vb} not installed locally; waiting for configureBackends before loading model "${modelId}"`
+          )
+          await this.configureBackendsPromise
+        } else {
+          logger.info(
+            `Backend already configured (${vb}), loading model "${modelId}" without waiting for full backend list`
+          )
+        }
       }
     }
 
@@ -3653,6 +3988,37 @@ export default class llamacpp_upstream_extension extends AIEngine {
     // llama-server only for it to crash with an opaque truncated-path error.
     await this.validateModelArtifacts(modelConfig, modelPath, mmprojPath)
 
+    // Llama 3.x `--jinja` auto-parser fix: the unsloth conversions embed a
+    // strict `raise_exception('System message must be at the beginning')`
+    // guard that the auto-parser's synthetic probes trip, failing parser
+    // generation with `400 Unable to generate parser`. Substitute the
+    // canonical Meta Llama 3.x template (no such guard) only when the user
+    // hasn't set an explicit chat_template.
+    if (!cfg.chat_template?.trim()) {
+      try {
+        const embedded = (await readGgufMetadata(modelPath))?.metadata?.[
+          'tokenizer.chat_template'
+        ] as string | undefined
+        const override = resolveLlama3TemplateOverride(modelId, embedded)
+        if (override) {
+          cfg.chat_template = override
+          logger.warn(
+            `[performLoad] Overriding strict embedded chat_template for "${modelId}" with the canonical Meta Llama 3.x template (auto-parser-safe).`
+          )
+        } else if (embedded?.includes(STRICT_SYSTEM_GUARD_SIGNATURE)) {
+          logger.warn(
+            `[performLoad] Model "${modelId}" has a strict system-message guard in its embedded chat_template but is not a recognized Llama 3.x format; leaving the template untouched.`
+          )
+        }
+      } catch (e) {
+        logger.warn(
+          `[performLoad] chat_template override probe failed for "${modelId}": ${
+            e instanceof Error ? e.message : String(e)
+          }`
+        )
+      }
+    }
+
     // Gemma 4 MTP: the draft head is a separate GGUF keyed to the loaded
     // target, so resolve it lazily here rather than only at toggle time. If
     // MTP is enabled, this model is a Gemma 4 31B / 26B-A4B target, and the
@@ -3692,20 +4058,114 @@ export default class llamacpp_upstream_extension extends AIEngine {
     // Passing it to a model that has no MTP layers makes llama-server abort the
     // load ("context type MTP requested but model doesn't contain MTP layers").
     // Only keep MTP enabled when the target actually supports it: a Qwen-style
-    // built-in MTP GGUF (its id carries "mtp", matching the UI's own heuristic)
-    // or a Gemma 4 target whose separate draft head was resolved above.
+    // built-in MTP GGUF identified by its canonical NextN metadata, or a Gemma
+    // 4 target whose separate draft head was resolved above.
     // Otherwise silently load without MTP (warn only) instead of crashing — this
     // covers every load entry point, not just the settings toggle, so the
     // Recommended Gemma 4 model can never be bricked by a stale global flag.
     if (cfg.mtp) {
-      const isQwenBuiltinMtp = modelId.toLowerCase().includes('mtp')
-      const hasGemmaDraft = cfg.mtp_draft_path.length > 0
-      if (!isQwenBuiltinMtp && !hasGemmaDraft) {
+      let ggufMetadata: Record<string, unknown> | undefined
+      try {
+        const gguf = await readGgufMetadata(modelPath)
+        ggufMetadata = gguf.metadata
+      } catch (error) {
+        logger.warn(
+          `[performLoad] Embedded MTP metadata probe failed for "${modelId}"; loading without built-in MTP: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      }
+      if (!isMtpCapable(ggufMetadata, cfg.mtp_draft_path)) {
         logger.warn(
           `MTP is enabled but model "${modelId}" has no MTP layers and no draft head; loading without MTP.`
         )
         cfg.mtp = false
       }
+    }
+
+    const backendPath = await getBackendExePath(backend, version)
+
+    // DFlash support is a property of the installed binary, not just the tag:
+    // probe `llama-server -h` so official builds that do not advertise
+    // draft-dflash stay safe, while compatible builds can use the draft.
+    cfg.dflash_spec_supported = cfg.dflash
+      ? await this.backendSupportsDflashSpec(backendPath, envs)
+      : false
+    if (cfg.dflash && !cfg.dflash_spec_supported) {
+      logger.warn(
+        `DFlash is enabled but this Llama.cpp backend does not support draft-dflash; loading "${modelId}" without DFlash.`
+      )
+      cfg.dflash = false
+    }
+
+    // DFlash: like Gemma 4 MTP, the draft is a separate GGUF keyed to the
+    // loaded target, so resolve it lazily here. If DFlash is enabled, this
+    // model is a DFlash-capable target, and the draft has not been
+    // downloaded/recorded yet (e.g. the user toggled DFlash on with no
+    // supported model active), fetch it now before building args.
+    if (
+      cfg.dflash &&
+      !modelConfig.dflash_draft_path &&
+      checkDflashSupport(modelId)
+    ) {
+      try {
+        await this.ensureDflashDraft(modelId)
+        const refreshed = await invoke<ModelConfig>('read_yaml', {
+          path: modelConfigPath,
+        })
+        modelConfig.dflash_draft_path = refreshed.dflash_draft_path
+      } catch (e) {
+        logger.warn(
+          `Failed to ensure DFlash draft for ${modelId}; loading without DFlash:`,
+          e
+        )
+      }
+    }
+
+    // Resolve the draft to an absolute path so the Rust arg builder can emit
+    // `--model-draft <path> --spec-type draft-dflash`.
+    if (cfg.dflash && modelConfig.dflash_draft_path) {
+      cfg.dflash_draft_path = await joinPath([
+        janDataFolderPath,
+        modelConfig.dflash_draft_path,
+      ])
+    } else {
+      cfg.dflash_draft_path = ''
+    }
+
+    // DFlash capability gate (mirrors the MTP gate). `dflash` is a
+    // provider-global toggle, so it stays on when switching models. Passing a
+    // model with no resolvable DFlash draft would make llama-server fail the
+    // load, so silently load without DFlash (warn only) instead of crashing.
+    if (cfg.dflash && cfg.dflash_draft_path.length === 0) {
+      logger.warn(
+        `DFlash is enabled but model "${modelId}" has no resolvable draft; loading without DFlash.`
+      )
+      cfg.dflash = false
+    }
+
+    // Compute --spec-draft-n-max from the user's DFlash block-size setting
+    // (n_max = block_size - 1). 0 tells the Rust builder to use its default.
+    if (cfg.dflash) {
+      const blockSize = Number(
+        (cfg as Record<string, unknown>).dflash_block_size
+      )
+      cfg.dflash_n_max =
+        Number.isFinite(blockSize) && blockSize > 1
+          ? Math.max(Math.floor(blockSize) - 1, 1)
+          : 0
+    } else {
+      cfg.dflash_n_max = 0
+    }
+
+    // Mutual exclusivity (defense-in-depth; the UI mutex should prevent this):
+    // if both MTP and DFlash survived their gates, prefer DFlash and drop MTP.
+    if (cfg.dflash && cfg.mtp) {
+      logger.warn(
+        `Both MTP and DFlash are enabled for "${modelId}"; applying DFlash only.`
+      )
+      cfg.mtp = false
+      cfg.mtp_draft_path = ''
     }
 
     if (!this.modelMaxCtxTrain.has(modelId)) {
@@ -3722,7 +4182,6 @@ export default class llamacpp_upstream_extension extends AIEngine {
       'Calling Tauri command load_llama_model with config:',
       JSON.stringify(cfg)
     )
-    const backendPath = await getBackendExePath(backend, version)
 
     try {
       const sInfo = await loadLlamaModel(
@@ -3956,6 +4415,64 @@ export default class llamacpp_upstream_extension extends AIEngine {
 
   /// Bridge from the Local API Server proxy (Rust) back to the extension
   /// when a forwarded request exhausts the model's context window. We
+  /// Handle an unexpected llama-server process exit that happened AFTER the
+  /// model had finished loading (i.e. during active generation). The Rust
+  /// post-load watcher task emits `SESSION_DIED_EVENT` and has already
+  /// removed the session entry from the Rust `process_map`.
+  ///
+  /// Responsibilities here:
+  ///  1. Clean up extension-level state (sessionCache, modelCtxSize) so
+  ///     the extension does not believe the model is still loaded.
+  ///  2. Attempt `this.unload()` for any remaining state cleanup (it will
+  ///     succeed even if the process is already gone — Rust returns "not
+  ///     found → success" in that case).
+  ///
+  /// Does NOT re-emit `SESSION_DIED_EVENT` on the Tauri bus: the Rust watcher
+  /// already emitted it once via `app_handle.emit(...)`, which is a
+  /// webview-wide broadcast that this extension's own `listen(SESSION_DIED_EVENT,
+  /// ...)` subscription (see onLoad) also receives directly — no relay needed.
+  /// A prior version of this method re-emitted the event "just in case",
+  /// which — because the extension listens to that very channel — caused the
+  /// re-emit to retrigger this same handler, which re-emitted again,
+  /// indefinitely. That infinite loop of no-op unload + emit calls pegged the
+  /// event loop (observed as the whole app hanging) and kept resurfacing the
+  /// crash toast / racing with a subsequent legitimate reload attempt (seen
+  /// as a spurious "Server is already running" toast on top of a model that
+  /// had actually reloaded fine). `DataProvider.tsx` listens to the raw Rust
+  /// event directly and needs nothing further from this method.
+  private async handleSessionDied(payload: {
+    model_id: string
+    pid: number
+    error_code: string
+    message: string
+  }): Promise<void> {
+    const { model_id, error_code, message } = payload
+    logger.warn(
+      `[sessionDied] llamacpp-upstream: model='${model_id}' crashed during generation ` +
+        `(code=${error_code}): ${message}`
+    )
+
+    // Best-effort unload first — it will look up the session in sessionCache,
+    // call Rust's unload (a no-op there since the watcher already removed the
+    // entry from process_map, which returns success), and then clean up
+    // sessionCache itself.
+    try {
+      await this.unload(model_id)
+    } catch (e) {
+      // Expected when the watcher already removed the entry from both the Rust
+      // process_map and sessionCache has no entry. Manually clean up.
+      this.sessionCache.delete(model_id)
+      logger.warn(`[sessionDied] unload for '${model_id}' was a no-op (already cleaned): ${e}`)
+    }
+
+    // modelCtxSize is not touched by unload(); clear it here.
+    this.modelCtxSize.delete(model_id)
+    // Keep modelMaxCtxTrain — it's read from the GGUF header and doesn't change.
+
+    // Intentionally no re-emit of SESSION_DIED_EVENT here — see the doc
+    // comment above this method for why that used to cause an infinite loop.
+  }
+
   /// unload + reload the model with a larger ctx_size, inform the proxy via
   /// a request-scoped done event, and notify the web-app UI so the Zustand
   /// provider store mirrors the new value (so the next UI interaction keeps
@@ -4116,11 +4633,12 @@ export default class llamacpp_upstream_extension extends AIEngine {
   }
 
   private createDownloadTaskId(modelId: string) {
-    // prepend provider to make taksId unique across providers
-    const cleanModelId = modelId.includes('.')
-      ? modelId.slice(0, modelId.indexOf('.'))
-      : modelId
-    return `${this.provider}/${cleanModelId}`
+    // Prepend provider to make taskId unique across providers. Do NOT
+    // truncate at the first '.' - model ids frequently contain a dot early
+    // in the name (e.g. "Qwen3.5-9B-...", "Llama-3.1-8B-..."), and truncating
+    // there collapsed distinct models onto the same taskId, causing one
+    // download's cancellation to silently clobber another's cancel token.
+    return `${this.provider}/${modelId}`
   }
 
   /**
@@ -4179,6 +4697,33 @@ export default class llamacpp_upstream_extension extends AIEngine {
         }
       }
       return { version, backend }
+    }
+
+    // ATO-233: Before attempting a network download (which may 404 or hang on
+    // a stale manifest tag), check whether a compatible backend of the SAME
+    // type is already installed locally at a DIFFERENT tag. Using the local
+    // copy avoids a failed/hanging download on the load path, and is the
+    // correct behaviour when the manifest tag drifts out of sync with what is
+    // actually present on the ggml-org CDN.
+    //
+    // Only applies on the load path (allowFallback=true). Explicit install/
+    // update flows keep the strict download-or-fail behaviour.
+    if (allowFallback) {
+      const sameTypeInstalled = await findCompatibleInstalledBackend(backend)
+      if (
+        sameTypeInstalled &&
+        (await isBackendInstalled(sameTypeInstalled.backend, sameTypeInstalled.version))
+      ) {
+        const localKey = `${sameTypeInstalled.version}/${sameTypeInstalled.backend}`
+        if (localKey !== backendKey) {
+          logger.warn(
+            `[ensureBackendReady] ${backendKey} not installed; found compatible local backend ` +
+              `${localKey} — using it without a network download (stale manifest tag or CDN 404).`
+          )
+          await this.persistVersionBackend(localKey)
+          return { version: sameTypeInstalled.version, backend: sameTypeInstalled.backend }
+        }
+      }
     }
 
     // ATO-179 (AC1): a stale, incomplete folder for this exact target (exists
@@ -4430,7 +4975,7 @@ export default class llamacpp_upstream_extension extends AIEngine {
     if (!(await fs.existsSync(tempDir))) {
       await fs.mkdir(tempDir)
     }
-    const archiveName = `llama-${version}-bin-${backend}.zip`
+    const archiveName = getBackendArchiveName(version, backend)
     const archivePath = await joinPath([tempDir, archiveName])
     const targetDir = await getBackendDir(backend, version)
 
@@ -4530,6 +5075,10 @@ export default class llamacpp_upstream_extension extends AIEngine {
       })
 
       const exeName = IS_WINDOWS ? 'llama-server.exe' : 'llama-server'
+      await invoke('normalize_backend_layout', {
+        outputDir: targetDir,
+        exeName,
+      })
       const expectedBin = await joinPath([targetDir, 'build', 'bin', exeName])
 
       if (!(await fs.existsSync(expectedBin))) {
@@ -4566,6 +5115,45 @@ export default class llamacpp_upstream_extension extends AIEngine {
             const src = await joinPath([targetDir, baseName])
             const dst = await joinPath([buildBinDir, baseName])
             await fs.mv(src, dst)
+          }
+        } else {
+          // Linux ggml-org tarballs can extract into a nested top-level
+          // directory such as `llama-b9691/` with `llama-server` and shared
+          // libraries inside it. Normalize that layout to the same
+          // `<backend>/build/bin/` shape used by bundled backends.
+          const entries = (await fs.readdirSync(targetDir)) as string[]
+          const nestedDirEntry = entries.find((rawEntry) => {
+            const baseName = rawEntry.split(/[/\\]/).filter(Boolean).pop()
+            return baseName?.startsWith('llama-')
+          })
+          if (nestedDirEntry) {
+            const nestedBaseName = nestedDirEntry
+              .split(/[/\\]/)
+              .filter(Boolean)
+              .pop()
+            if (nestedBaseName) {
+              const nestedDir = await joinPath([targetDir, nestedBaseName])
+              const nestedBin = await joinPath([nestedDir, exeName])
+              if (await fs.existsSync(nestedBin)) {
+                logger.info(
+                  `Relocating nested backend layout ${nestedBaseName}/ into build/bin/`
+                )
+                const buildBinDir = await joinPath([targetDir, 'build', 'bin'])
+                await fs.mkdir(buildBinDir)
+                const nestedEntries = (await fs.readdirSync(nestedDir)) as string[]
+                for (const rawNestedEntry of nestedEntries) {
+                  const baseName = rawNestedEntry
+                    .split(/[/\\]/)
+                    .filter(Boolean)
+                    .pop()
+                  if (!baseName) continue
+                  const src = await joinPath([nestedDir, baseName])
+                  const dst = await joinPath([buildBinDir, baseName])
+                  await fs.mv(src, dst)
+                }
+                await fs.rm(nestedDir)
+              }
+            }
           }
         }
       }

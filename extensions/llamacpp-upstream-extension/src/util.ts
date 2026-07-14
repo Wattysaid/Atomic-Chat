@@ -112,6 +112,47 @@ export function matchesMtpLoadFailure(text: string): boolean {
   )
 }
 
+const EMBEDDED_MTP_ARCHITECTURES = new Set(['qwen35', 'qwen35moe'])
+
+/**
+ * Detect a combined Qwen GGUF whose MTP head is embedded in the target file.
+ * llama.cpp derives the same split from `{arch}.block_count` and
+ * `{arch}.nextn_predict_layers`; filenames and repository names are not part
+ * of the model format contract.
+ */
+export function hasEmbeddedMtp(
+  metadata: Record<string, unknown> | undefined | null
+): boolean {
+  if (!metadata) return false
+
+  const architecture = metadata['general.architecture']
+  if (
+    typeof architecture !== 'string' ||
+    !EMBEDDED_MTP_ARCHITECTURES.has(architecture)
+  ) {
+    return false
+  }
+
+  const blockCount = Number(metadata[`${architecture}.block_count`])
+  const nextnPredictLayers = Number(
+    metadata[`${architecture}.nextn_predict_layers`]
+  )
+
+  return (
+    Number.isInteger(blockCount) &&
+    Number.isInteger(nextnPredictLayers) &&
+    nextnPredictLayers > 0 &&
+    blockCount > nextnPredictLayers
+  )
+}
+
+export function isMtpCapable(
+  metadata: Record<string, unknown> | undefined | null,
+  mtpDraftPath: string
+): boolean {
+  return mtpDraftPath.length > 0 || hasEmbeddedMtp(metadata)
+}
+
 // Zustand proxy state structure
 interface ProxyState {
   proxyEnabled: boolean

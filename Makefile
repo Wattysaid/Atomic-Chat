@@ -732,11 +732,16 @@ endif
 # api.github.com — its macos-arm64/-x64 assets are not in the manifest
 # (macOS is bundle-only at runtime). GH_TOKEN only matters for the macOS
 # branch now.
-# Override LLAMACPP_UPSTREAM_TAG to pin a specific upstream release, e.g.:
+# Pinned to a known-good upstream release while we hold off on auto-tracking
+# new ggml-org tags (2026-07-03). Override to pin a different release, or set
+# to empty to resume auto-resolving the latest release (macOS) / the tag from
+# the atomic-chat-conf manifest (Windows/Linux), e.g.:
 #   make download-llamacpp-upstream-backend LLAMACPP_UPSTREAM_TAG=b9222
-LLAMACPP_UPSTREAM_TAG ?=
+#   make download-llamacpp-upstream-backend LLAMACPP_UPSTREAM_TAG=
+LLAMACPP_UPSTREAM_TAG ?= b9937
 download-llamacpp-upstream-backend:
 ifeq ($(shell uname -s),Darwin)
+	@rm -rf src-tauri/resources/llamacpp-backend-upstream
 	@mkdir -p src-tauri/resources/llamacpp-backend-upstream
 	@ARCH=$$(uname -m); \
 	if [ "$$ARCH" = "arm64" ]; then BACKEND="macos-arm64"; else BACKEND="macos-x64"; fi; \

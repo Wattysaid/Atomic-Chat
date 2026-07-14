@@ -1378,11 +1378,12 @@ export default class mlx_extension extends AIEngine {
   }
 
   private createDownloadTaskId(modelId: string) {
-    // prepend provider to make taksId unique across providers
-    const cleanModelId = modelId.includes('.')
-      ? modelId.slice(0, modelId.indexOf('.'))
-      : modelId
-    return `${this.provider}/${cleanModelId}`
+    // Prepend provider to make taskId unique across providers. Do NOT
+    // truncate at the first '.' - model ids frequently contain a dot early
+    // in the name (e.g. "Qwen3.5-9B-...", "Llama-3.1-8B-..."), and truncating
+    // there collapsed distinct models onto the same taskId, causing one
+    // download's cancellation to silently clobber another's cancel token.
+    return `${this.provider}/${modelId}`
   }
 
   override async abortImport(modelId: string): Promise<void> {

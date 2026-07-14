@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{Manager, Runtime, State};
+use tauri::{Emitter, Manager, Runtime, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
@@ -36,6 +36,29 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct UnloadResult {
     success: bool,
     error: Option<String>,
+}
+
+/// Returns true if a llama-server log line (stdout or stderr, already
+/// lowercased) indicates the HTTP server has started listening.
+///
+/// Upstream `ggml-org/llama.cpp` has changed the exact wording of this
+/// message before without warning (e.g. commit `27c8bb4f6`, first
+/// released in `b9829`, dropped "server is" from "server is listening
+/// on ..." down to a bare "listening on ..."), which silently broke
+/// readiness detection here and caused loads to hang for the full
+/// `timeout_duration` before failing. Matching on the stable substring
+/// "listening on" (present in every historical variant: "server is
+/// listening on", "server listening on", "router server is listening
+/// on", and the current bare "listening on") is robust to any further
+/// upstream rewording of the surrounding words. `/health` is the
+/// primary, wording-independent readiness signal (see the HTTP poll in
+/// `load_llama_model_impl`); this log-based check is a fast, low-cost
+/// complement to it and a fallback for it.
+fn is_ready_log_line(line_lower: &str) -> bool {
+    line_lower.contains("listening on")
+        || line_lower.contains("all slots are idle")
+        || line_lower.contains("starting the main loop")
+        || line_lower.contains("http server listening")
 }
 
 /// Core model loading logic usable without an AppHandle (CLI / test support).
@@ -97,6 +120,16 @@ pub async fn load_llama_model_impl(
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    // Kill the spawned llama-server if this load future is dropped before the
+    // child is handed off to the tracked `process_map` (e.g. a rapid model
+    // switch or onboarding retry supersedes/cancels an in-flight load). Without
+    // this, tokio leaves the process running: it never enters `process_map`, so
+    // neither `stop`/`stop_all` nor `cleanup_processes` (which only act on the
+    // map) can ever reap it — orphaned `llama-server` instances then pile up and
+    // hold ports/RAM until the user kills them by hand. Once the child *is*
+    // inserted into the map it is owned there (not dropped), so healthy sessions
+    // keep running normally.
+    command.kill_on_drop(true);
     setup_windows_process_flags(&mut command);
 
     // Try to add CUDA paths (works on both Windows and Linux)
@@ -140,10 +173,7 @@ pub async fn load_llama_model_impl(
 
                     // Check for readiness indicators
                     let line_lower = line.to_lowercase();
-                    if line_lower.contains("http server listening")
-                        || line_lower.contains("all slots are idle")
-                        || line_lower.contains("starting the main loop")
-                    {
+                    if is_ready_log_line(&line_lower) {
                         log::info!("Server appears to be ready based on stdout: '{}'", line);
                         let _ = stdout_ready_tx.send(true).await;
                     }
@@ -157,6 +187,7 @@ pub async fn load_llama_model_impl(
     });
 
     // Spawn task to capture stderr and monitor for errors
+    let stderr_ready_tx = ready_tx.clone();
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut byte_buffer = Vec::new();
@@ -177,12 +208,9 @@ pub async fn load_llama_model_impl(
 
                         // Check for readiness indicator
                         let line_lower = line.to_string().to_lowercase();
-                        if line_lower.contains("server is listening on")
-                            || line_lower.contains("starting the main loop")
-                            || line_lower.contains("server listening on")
-                        {
+                        if is_ready_log_line(&line_lower) {
                             log::info!("Model appears to be ready based on logs: '{}'", line);
-                            let _ = ready_tx.send(true).await;
+                            let _ = stderr_ready_tx.send(true).await;
                         }
                     }
                 }
@@ -196,9 +224,43 @@ pub async fn load_llama_model_impl(
         stderr_buffer
     });
 
+    // Poll the /health endpoint as a version-independent readiness signal,
+    // complementing the log-line matchers above. Upstream has changed the
+    // "listening" log wording before with no warning (see `is_ready_log_line`)
+    // and could again; `/health` is a stable contract across every llama.cpp
+    // version we've observed — HTTP 503 with a JSON error body while the
+    // model is loading, HTTP 200 with `{"status":"ok"}` once ready — so this
+    // path keeps working even if every log-based matcher above goes stale.
+    let health_ready_tx = ready_tx.clone();
+    let health_task: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Failed to build health-check HTTP client: {}", e);
+                return;
+            }
+        };
+        let url = format!("http://127.0.0.1:{}/health", port);
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Ok(resp) = client.get(&url).send().await {
+                if resp.status().is_success() {
+                    log::info!("Server appears to be ready based on /health check");
+                    let _ = health_ready_tx.send(true).await;
+                    break;
+                }
+            }
+        }
+    });
+
     // Check if process exited early
     if let Some(status) = child.try_wait()? {
         if !status.success() {
+            health_task.abort();
             let stderr_output = stderr_task.await.unwrap_or_default();
             // WS1.1/WS3.2: warn! (not error!) so the SentryLogger bridge does not
             // raise a duplicate crash event — the structured error returned below
@@ -220,12 +282,14 @@ pub async fn load_llama_model_impl(
             // Server is ready
             Some(true) = ready_rx.recv() => {
                 log::info!("Model is ready to accept requests!");
+                health_task.abort();
                 break;
             }
             // Check for process exit more frequently
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 // Check if process exited
                 if let Some(status) = child.try_wait()? {
+                    health_task.abort();
                     let stderr_output = stderr_task.await.unwrap_or_default();
                     if !status.success() {
                         // WS1.1: warn! (not error!) — the structured error returned
@@ -244,6 +308,7 @@ pub async fn load_llama_model_impl(
                 // Timeout check
                 if start_time.elapsed() > timeout_duration {
                     log::error!("Timeout waiting for server to be ready");
+                    health_task.abort();
                     let _ = child.kill().await;
                     let stderr_output = stderr_task.await.unwrap_or_default();
                     return Err(LlamacppError::new(
@@ -284,6 +349,11 @@ pub async fn load_llama_model_impl(
     Ok(session_info)
 }
 
+/// Tauri event emitted when a llama-server child process that was running
+/// (i.e. had already loaded a model) exits unexpectedly during generation.
+/// Payload: `{ model_id, pid, error_code, message }`.
+pub const SESSION_DIED_EVENT: &str = "local_backend://llamacpp_upstream_session_died";
+
 /// Load a llama model and start the server
 #[tauri::command]
 pub async fn load_llama_model<R: Runtime>(
@@ -299,7 +369,7 @@ pub async fn load_llama_model<R: Runtime>(
     timeout: u64,
 ) -> ServerResult<SessionInfo> {
     let state: State<LlamacppState> = app_handle.state();
-    load_llama_model_impl(
+    let session_info = load_llama_model_impl(
         state.llama_server_process.clone(),
         backend_path,
         model_id,
@@ -311,7 +381,105 @@ pub async fn load_llama_model<R: Runtime>(
         is_embedding,
         timeout,
     )
-    .await
+    .await?;
+
+    // Spawn a background watcher task that detects unexpected process exits
+    // (crashes during generation). Without this watcher, a Vulkan or other
+    // backend crash that happens AFTER the model loads is invisible: no exit
+    // code is classified, no Sentry event fires, and the user only sees a
+    // broken HTTP stream with no actionable message.
+    //
+    // The watcher polls `try_wait()` (non-blocking) on the child every 500 ms.
+    // When the process exits unexpectedly it:
+    //   1. Removes the session from the process_map (so unload is a no-op).
+    //   2. Classifies the exit via `from_exit_status` (SIGSEGV/SIGABRT etc.).
+    //   3. Logs at `error!` so the Sentry logger bridge forwards it as a crash event.
+    //   4. Emits `SESSION_DIED_EVENT` so the extension and web-app can surface
+    //      an actionable "model crashed during generation" message.
+    //
+    // Intentional unloads are transparent: `unload_llama_model` removes the
+    // entry from the map, so the watcher finds `None` on its next poll and exits.
+    let pid = session_info.pid;
+    let process_map_watcher = state.llama_server_process.clone();
+    let app_handle_watcher = app_handle.clone();
+    tokio::spawn(async move {
+        const POLL_INTERVAL: Duration = Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            // Scope the lock acquisition tightly so we do not hold it across
+            // the sleep. try_wait() is synchronous and non-blocking.
+            let poll_outcome: Result<Option<(std::process::ExitStatus, SessionInfo)>, ()> = {
+                let mut map = process_map_watcher.lock().await;
+                match map.get_mut(&pid) {
+                    None => Err(()), // Session intentionally removed by unload
+                    Some(session) => {
+                        match session.child.try_wait() {
+                            Ok(None) => Ok(None), // Still running
+                            Ok(Some(status)) => {
+                                let info = session.info.clone();
+                                // Remove from map so subsequent unload calls are no-ops
+                                map.remove(&pid);
+                                Ok(Some((status, info)))
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "llamacpp-upstream watcher: try_wait error for PID {}: {}",
+                                    pid,
+                                    e
+                                );
+                                Err(())
+                            }
+                        }
+                    }
+                }
+            }; // lock released here
+
+            match poll_outcome {
+                Ok(None) => {} // Still running — continue polling
+                Err(()) => break,
+                Ok(Some((status, info))) => {
+                    // Unexpected exit: classify and report.
+                    let error = LlamacppError::from_exit_status(&status, "");
+                    // log::error! → Sentry logger bridge (ATO-244: generation-time
+                    // crashes were previously invisible to Sentry because the
+                    // classification path was only wired to the load path).
+                    log::error!(
+                        "llamacpp-upstream: llama-server (PID {}, model='{}') exited \
+                         unexpectedly during generation — code={:?} — {}",
+                        pid,
+                        info.model_id,
+                        status.code(),
+                        error.message
+                    );
+
+                    #[derive(serde::Serialize)]
+                    struct SessionDiedPayload {
+                        model_id: String,
+                        pid: i32,
+                        error_code: String,
+                        message: String,
+                    }
+                    let payload = SessionDiedPayload {
+                        model_id: info.model_id.clone(),
+                        pid: info.pid,
+                        error_code: format!("{:?}", error.code),
+                        message: error.message.clone(),
+                    };
+                    if let Err(e) = app_handle_watcher.emit(SESSION_DIED_EVENT, &payload) {
+                        log::warn!(
+                            "llamacpp-upstream watcher: failed to emit {} event: {}",
+                            SESSION_DIED_EVENT,
+                            e
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(session_info)
 }
 
 /// Unload a llama model by terminating its process
@@ -356,6 +524,54 @@ pub async fn get_devices(
     envs: HashMap<String, String>,
 ) -> ServerResult<Vec<DeviceInfo>> {
     get_devices_from_backend(backend_path, envs).await
+}
+
+/// Check whether the installed llama-server binary advertises a speculative type.
+#[tauri::command]
+pub async fn check_spec_type_support(
+    backend_path: &str,
+    spec_type: &str,
+    envs: HashMap<String, String>,
+) -> ServerResult<bool> {
+    let bin_path = validate_binary_path(backend_path)?;
+    let mut command = Command::new(&bin_path);
+    command.arg("-h");
+    command.envs(envs);
+    setup_windows_process_flags(&mut command);
+    let cuda_found = add_cuda_paths(&mut command);
+    if !cuda_found && binary_requires_cuda(&bin_path) {
+        log::warn!(
+            "llama.cpp backend appears to require CUDA, but CUDA not found. Capability probe may fail."
+        );
+    }
+    setup_library_path(bin_path.parent(), &mut command);
+
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .map_err(|_| {
+            LlamacppError::new(
+                ErrorCode::ModelLoadTimedOut,
+                "Timed out while probing llama.cpp backend capabilities.".into(),
+                Some(format!(
+                    "llama-server -h did not finish within 5s for {}",
+                    backend_path
+                )),
+            )
+        })?
+        .map_err(|e| {
+            LlamacppError::new(
+                ErrorCode::ModelLoadFailed,
+                "Could not probe llama.cpp backend capabilities.".into(),
+                Some(e.to_string()),
+            )
+        })?;
+
+    let help = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(help.contains(spec_type))
 }
 
 /// Generate API key using HMAC-SHA256

@@ -57,6 +57,7 @@ import { useAppState } from '@/hooks/useAppState'
 import { ExtensionManager } from '@/lib/extension'
 import { ExtensionTypeEnum, VectorDBExtension } from '@janhq/core'
 import { ttftMark } from '@/lib/ttft-timing'
+import { extractModelErrorMessage } from '@/lib/modelErrorMessage'
 
 /// Local inference backends (mlx, llamacpp, llamacpp-upstream,
 /// foundation-models) get special handling at the `streamText` boundary:
@@ -186,6 +187,62 @@ export function foldSystemIntoFirstUserMessage<
   const copy = [...messages]
   copy[idx] = { ...target, content: newContent } as T
   return copy
+}
+
+export function shouldSuppressToolsForUpstreamDflash(
+  providerId: string,
+  settings: readonly ProviderSetting[] | undefined
+): boolean {
+  return (
+    providerId === 'llamacpp-upstream' &&
+    settings?.some(
+      (setting) =>
+        setting.key === 'dflash' &&
+        setting.controller_props.value === true
+    ) === true
+  )
+}
+
+export function withUpstreamDflashSampling(
+  providerId: string,
+  settings: readonly ProviderSetting[] | undefined,
+  params: Record<string, unknown>
+): Record<string, unknown> {
+  if (!shouldSuppressToolsForUpstreamDflash(providerId, settings)) return params
+  return {
+    ...params,
+    temperature: 0,
+    top_k: 1,
+    repeat_penalty: 1,
+    presence_penalty: 0,
+    frequency_penalty: 0,
+  }
+}
+
+export function withUpstreamDflashReasoningOverride(
+  providerId: string,
+  settings: readonly ProviderSetting[] | undefined,
+  override: Record<string, unknown>
+): Record<string, unknown> {
+  if (!shouldSuppressToolsForUpstreamDflash(providerId, settings)) {
+    return override
+  }
+
+  const existingTemplateKwargs =
+    typeof override.chat_template_kwargs === 'object' &&
+    override.chat_template_kwargs !== null &&
+    !Array.isArray(override.chat_template_kwargs)
+      ? (override.chat_template_kwargs as Record<string, unknown>)
+      : {}
+
+  return {
+    ...override,
+    chat_template_kwargs: {
+      ...existingTemplateKwargs,
+      enable_thinking: false,
+    },
+    reasoning_budget: 0,
+  }
 }
 
 export type TokenUsageCallback = (
@@ -523,10 +580,16 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
         // top_k 64) is layered on at request time unless the user has tuned
         // sampling themselves — non-destructive, follows the active model.
         const samplingState = useSamplingSettings.getState()
-        const inferenceParams = withRecommendedSampling(
-          modelId,
-          samplingState.getParams(),
-          samplingState.userOverridden
+        const providerSettings =
+          updatedProvider?.settings ?? provider.settings
+        const inferenceParams = withUpstreamDflashSampling(
+          providerId,
+          providerSettings,
+          withRecommendedSampling(
+            modelId,
+            samplingState.getParams(),
+            samplingState.userOverridden
+          )
         )
 
         // Global "Disable reasoning" setting — best-effort: dispatch the
@@ -600,7 +663,14 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
           reasoningOverride.reasoning_budget =
             reasoningBudgetTokens[reasoningBudget]
         }
-        const hasOverride = Object.keys(reasoningOverride).length > 0
+        const effectiveReasoningOverride =
+          withUpstreamDflashReasoningOverride(
+            providerId,
+            providerSettings,
+            reasoningOverride
+          )
+        const hasOverride =
+          Object.keys(effectiveReasoningOverride).length > 0
 
         // Audio attachments (omni/audio-capable models, MLX backend) are
         // injected as `input_audio` at the MLX fetch layer rather than as
@@ -616,14 +686,14 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
           modelId,
           updatedProvider ?? provider,
           inferenceParams ?? {},
-          hasOverride ? reasoningOverride : undefined,
+          hasOverride ? effectiveReasoningOverride : undefined,
           audioInputParts.length > 0 ? audioInputParts : undefined
         )
         ttftMark('deltaEnd')
       } catch (error) {
         console.error('Failed to create model:', error)
         throw new Error(
-          `Failed to create model: ${error instanceof Error ? error.message : JSON.stringify(error)}`
+          `Failed to create model: ${extractModelErrorMessage(error)}`
         )
       }
     } else {
@@ -732,7 +802,12 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     const selectedModel = useModelProvider.getState().selectedModel
     const modelSupportsTools =
       selectedModel?.capabilities?.includes('tools') ?? this.modelSupportsTools
-    const shouldEnableTools = hasTools && modelSupportsTools
+    const suppressToolsForDflash = shouldSuppressToolsForUpstreamDflash(
+      effectiveProviderName,
+      provider.settings
+    )
+    const shouldEnableTools =
+      hasTools && modelSupportsTools && !suppressToolsForDflash
 
     const dropSystemForTools =
       isLocalProvider && shouldEnableTools && !!this.systemMessage

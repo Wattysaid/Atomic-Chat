@@ -66,6 +66,10 @@ export function normalizeLlamacppConfig(config: any): LlamacppConfig {
     cont_batching: asBool(config.cont_batching),
     mtp: asBool(config.mtp),
     mtp_draft_path: asString(config.mtp_draft_path),
+    dflash: asBool(config.dflash),
+    dflash_spec_supported: asBool(config.dflash_spec_supported),
+    dflash_draft_path: asString(config.dflash_draft_path),
+    dflash_n_max: asNumber(config.dflash_n_max),
 
     no_mmap: asBool(config.no_mmap),
     mlock: asBool(config.mlock),
@@ -126,6 +130,18 @@ export async function getDevices(
   return await invoke('plugin:llamacpp-upstream|get_devices', {
     backendPath,
     libraryPath,
+  })
+}
+
+export async function checkSpecTypeSupport(
+  backendPath: string,
+  specType: string,
+  envs: Record<string, string>
+): Promise<boolean> {
+  return await invoke('plugin:llamacpp-upstream|check_spec_type_support', {
+    backendPath,
+    specType,
+    envs,
   })
 }
 
@@ -361,6 +377,20 @@ export async function installBundledBackend(
   backendsDir: string
 ): Promise<BundledBackendResult> {
   return invoke('plugin:llamacpp-upstream|install_bundled_backend', { backendsDir })
+}
+
+/**
+ * Fetch the backend-index manifest JSON over an HTTP/1.1-only reqwest
+ * connection. Used as a fallback transport on Linux where reqwest's HTTP/2
+ * negotiation against the Fastly CDN (raw.githubusercontent.com) stalls
+ * indefinitely (h2-stall). Returns the raw JSON string. Throws on network
+ * error or non-2xx response.
+ */
+export async function fetchManifestHttp1(
+  url: string,
+  timeoutMs: number
+): Promise<string> {
+  return invoke('plugin:llamacpp-upstream|fetch_manifest_http1', { url, timeoutMs })
 }
 
 export * from './types'

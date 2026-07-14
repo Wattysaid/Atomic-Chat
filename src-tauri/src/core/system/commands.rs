@@ -111,7 +111,10 @@ fn write_env_to_shell(env_file_path: &str, env_vars: &[(String, String)]) -> Res
 }
 
 #[tauri::command]
-pub fn factory_reset<R: Runtime>(app_handle: tauri::AppHandle<R>, state: State<'_, AppState>) {
+pub async fn factory_reset<R: Runtime>(
+    app_handle: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     // close window (not available on mobile platforms)
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
@@ -125,77 +128,74 @@ pub fn factory_reset<R: Runtime>(app_handle: tauri::AppHandle<R>, state: State<'
     let data_folder = get_jan_data_folder_path(app_handle.clone());
     log::info!("Factory reset, removing data folder: {data_folder:?}");
 
-    tauri::async_runtime::block_on(async {
-        let _ =
-            stop_mcp_servers_with_context(&app_handle, &state, ShutdownContext::FactoryReset).await;
+    let _ = stop_mcp_servers_with_context(&app_handle, &state, ShutdownContext::FactoryReset).await;
 
-        {
-            let mut active_servers = state.mcp_active_servers.lock().await;
-            active_servers.clear();
+    {
+        let mut active_servers = state.mcp_active_servers.lock().await;
+        active_servers.clear();
+    }
+
+    use crate::core::mcp::lockfile::cleanup_own_locks;
+    if let Err(e) = cleanup_own_locks(&app_handle) {
+        log::warn!("Failed to cleanup lock files: {}", e);
+    }
+    // Clean up both llama.cpp providers' process maps.
+    let _ = cleanup_llama_processes(app_handle.clone()).await;
+    let _ = tauri_plugin_llamacpp_upstream::cleanup_llama_processes(app_handle.clone()).await;
+
+    // Windows needs time to release file handles after TerminateProcess
+    #[cfg(windows)]
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    if data_folder.exists() {
+        if !is_safe_to_delete(&data_folder) {
+            log::error!(
+                "Refusing factory reset: path is too close to filesystem root: {}",
+                data_folder.display()
+            );
+            return Ok(());
         }
 
-        use crate::core::mcp::lockfile::cleanup_own_locks;
-        if let Err(e) = cleanup_own_locks(&app_handle) {
-            log::warn!("Failed to cleanup lock files: {}", e);
-        }
-        // Clean up both llama.cpp providers' process maps.
-        let _ = cleanup_llama_processes(app_handle.clone()).await;
-        let _ = tauri_plugin_llamacpp_upstream::cleanup_llama_processes(app_handle.clone()).await;
-
-        // Windows needs time to release file handles after TerminateProcess
-        #[cfg(windows)]
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-        if data_folder.exists() {
-            if !is_safe_to_delete(&data_folder) {
-                log::error!(
-                    "Refusing factory reset: path is too close to filesystem root: {}",
-                    data_folder.display()
-                );
-                return;
+        // Preserve downloaded llamacpp backends across factory reset so the user
+        // doesn't have to re-download CUDA/Vulkan binaries (can be hundreds of MB).
+        let backends_dir = data_folder.join("llamacpp").join("backends");
+        let temp_backends = std::env::temp_dir().join("atomic-chat-backends-preserve");
+        let backends_preserved = if backends_dir.is_dir() {
+            if temp_backends.exists() {
+                let _ = fs::remove_dir_all(&temp_backends);
             }
-
-            // Preserve downloaded llamacpp backends across factory reset so the user
-            // doesn't have to re-download CUDA/Vulkan binaries (can be hundreds of MB).
-            let backends_dir = data_folder.join("llamacpp").join("backends");
-            let temp_backends = std::env::temp_dir().join("atomic-chat-backends-preserve");
-            let backends_preserved = if backends_dir.is_dir() {
-                if temp_backends.exists() {
-                    let _ = fs::remove_dir_all(&temp_backends);
+            match fs::rename(&backends_dir, &temp_backends) {
+                Ok(()) => {
+                    log::info!("Preserved llamacpp backends to temp dir");
+                    true
                 }
-                match fs::rename(&backends_dir, &temp_backends) {
-                    Ok(()) => {
-                        log::info!("Preserved llamacpp backends to temp dir");
-                        true
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to preserve llamacpp backends: {e}");
-                        false
-                    }
-                }
-            } else {
-                false
-            };
-
-            remove_jan_data_contents(&data_folder);
-
-            if backends_preserved {
-                let llamacpp_dir = data_folder.join("llamacpp");
-                let _ = fs::create_dir_all(&llamacpp_dir);
-                match fs::rename(&temp_backends, &backends_dir) {
-                    Ok(()) => log::info!("Restored llamacpp backends after factory reset"),
-                    Err(e) => log::warn!("Failed to restore llamacpp backends: {e}"),
+                Err(e) => {
+                    log::warn!("Failed to preserve llamacpp backends: {e}");
+                    false
                 }
             }
+        } else {
+            false
+        };
+
+        remove_jan_data_contents(&data_folder);
+
+        if backends_preserved {
+            let llamacpp_dir = data_folder.join("llamacpp");
+            let _ = fs::create_dir_all(&llamacpp_dir);
+            match fs::rename(&temp_backends, &backends_dir) {
+                Ok(()) => log::info!("Restored llamacpp backends after factory reset"),
+                Err(e) => log::warn!("Failed to restore llamacpp backends: {e}"),
+            }
         }
+    }
 
-        // Reset the configuration
-        let mut default_config = AppConfiguration::default();
-        default_config.data_folder = default_data_folder_path(app_handle.clone());
-        let _ = update_app_configuration(app_handle.clone(), default_config);
+    // Reset the configuration
+    let mut default_config = AppConfiguration::default();
+    default_config.data_folder = default_data_folder_path(app_handle.clone());
+    let _ = update_app_configuration(app_handle.clone(), default_config);
 
-        app_handle.restart();
-    });
+    app_handle.restart()
 }
 
 #[tauri::command]
@@ -242,6 +242,50 @@ pub fn open_file_explorer(path: String) {
             .arg(path)
             .status()
             .expect("Failed to open file explorer");
+    }
+}
+
+/// Deliver a desktop notification from the blocking pool.
+///
+/// On Linux, do not use the notification plugin: its builder `show()` is
+/// fire-and-forget — it re-spawns the blocking `notify_rust` delivery onto a
+/// tokio runtime worker (`tauri::async_runtime::spawn`). There, delivery goes
+/// over D-Bus via `zbus`, whose `tokio`-feature blocking wrapper calls
+/// `Runtime::block_on` — that panics on a runtime worker ("Cannot start a
+/// runtime from within a runtime"), the detached task dies, and the
+/// notification is silently dropped while the command still returns Ok.
+/// Calling `notify_rust` directly from `spawn_blocking` keeps the zbus
+/// `block_on` on a blocking-pool thread, where it is allowed.
+#[tauri::command]
+pub async fn show_desktop_notification<R: Runtime>(
+    app: AppHandle<R>,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app;
+        tauri::async_runtime::spawn_blocking(move || {
+            notify_rust::Notification::new()
+                .summary(&title)
+                .body(&body)
+                .auto_icon()
+                .show()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Notification task failed: {e}"))?
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use tauri_plugin_notification::NotificationExt;
+        app.notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -986,13 +1030,7 @@ pub fn configure_hermes_agent(
     api_key: Option<String>,
     context_length: Option<u32>,
 ) -> Result<(), String> {
-    let home_dir = if cfg!(windows) {
-        std::env::var("USERPROFILE").map_err(|e| e.to_string())?
-    } else {
-        std::env::var("HOME").map_err(|e| e.to_string())?
-    };
-
-    let hermes_dir = std::path::PathBuf::from(&home_dir).join(".hermes");
+    let hermes_dir = resolve_hermes_dir()?;
     let config_path = hermes_dir.join("config.yaml");
     let env_path = hermes_dir.join(".env");
 
@@ -1001,7 +1039,7 @@ pub fn configure_hermes_agent(
     // logic below has the anchors it expects, instead of failing outright.
     if !config_path.exists() {
         std::fs::create_dir_all(&hermes_dir)
-            .map_err(|e| format!("Failed to create ~/.hermes directory: {}", e))?;
+            .map_err(|e| format!("Failed to create Hermes home directory: {}", e))?;
         std::fs::write(&config_path, HERMES_DEFAULT_CONFIG)
             .map_err(|e| format!("Failed to create config.yaml: {}", e))?;
     }
@@ -1097,13 +1135,7 @@ pub fn configure_hermes_agent(
 
 #[tauri::command]
 pub fn clear_hermes_agent_config() -> Result<(), String> {
-    let home_dir = if cfg!(windows) {
-        std::env::var("USERPROFILE").map_err(|e| e.to_string())?
-    } else {
-        std::env::var("HOME").map_err(|e| e.to_string())?
-    };
-
-    let hermes_dir = std::path::PathBuf::from(&home_dir).join(".hermes");
+    let hermes_dir = resolve_hermes_dir()?;
     let config_path = hermes_dir.join("config.yaml");
 
     if !config_path.exists() {
@@ -1211,6 +1243,71 @@ const HERMES_DEFAULT_CONFIG: &str = "model:
   base_url: https://openrouter.ai/api/v1
 custom_providers: []
 ";
+
+/// Resolve the Hermes Agent home directory, mirroring the resolution order of
+/// Hermes' own `hermes_constants.py::get_hermes_home()`: an explicit
+/// `HERMES_HOME` env var wins, else the platform-native default
+/// (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes` elsewhere).
+///
+/// On Windows the native installer (`install.ps1`) sets `HERMES_HOME` via
+/// `[Environment]::SetEnvironmentVariable(..., "User")` -- a registry write
+/// that is invisible to Atomic Chat's own already-running process (which only
+/// sees the environment block snapshotted at its own startup). So
+/// `std::env::var("HERMES_HOME")` can be stale within the same app session
+/// that just installed Hermes. Reading the registry value directly first
+/// (mirroring Hermes' own official desktop app, which hit and fixed this
+/// exact gap) avoids ever writing to a config file the `hermes` CLI won't
+/// read.
+fn resolve_hermes_dir() -> Result<std::path::PathBuf, String> {
+    if cfg!(windows) {
+        if let Some(home) = read_windows_user_env("HERMES_HOME").filter(|s| !s.is_empty()) {
+            return Ok(std::path::PathBuf::from(home));
+        }
+        if let Ok(home) = std::env::var("HERMES_HOME") {
+            if !home.is_empty() {
+                return Ok(std::path::PathBuf::from(home));
+            }
+        }
+        let local_appdata = std::env::var("LOCALAPPDATA").map_err(|e| e.to_string())?;
+        Ok(std::path::PathBuf::from(local_appdata).join("hermes"))
+    } else {
+        let home_dir = std::env::var("HOME").map_err(|e| e.to_string())?;
+        Ok(std::path::PathBuf::from(home_dir).join(".hermes"))
+    }
+}
+
+/// Read a single User-scope Windows environment variable fresh from the
+/// registry (`HKCU\Environment`), bypassing the current process's stale
+/// environment-block snapshot. Returns `None` off Windows, on read failure,
+/// or when the value is empty/absent.
+#[cfg(windows)]
+fn read_windows_user_env(name: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        &format!("[Environment]::GetEnvironmentVariable('{}', 'User')", name),
+    ]);
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+#[cfg(not(windows))]
+fn read_windows_user_env(_name: &str) -> Option<String> {
+    None
+}
 
 /// Split the config into (before, entries, after) around `custom_providers:`.
 /// `entries` is a Vec of Vec<String>, one per YAML list item.
@@ -1640,6 +1737,55 @@ fn agent_install_spec(
             let prereq = if cfg!(windows) { "powershell" } else { "curl" };
             Ok((program, args, prereq, "https://github.com/NousResearch/hermes-agent"))
         }
+        "openclaude" => {
+            let (p, a) = npm("@gitlawb/openclaude");
+            Ok((
+                p,
+                a,
+                "npm",
+                "https://github.com/Gitlawb/openclaude",
+            ))
+        }
+        "poolside" => {
+            // Poolside ships via an official shell / PowerShell bootstrap script.
+            // `POOL_INSTALL_ACCEPT_EULA=1` skips the interactive EULA prompt so
+            // the installer doesn't hang reading from /dev/tty when spawned from
+            // the app, and `POOL_INSTALL_UPDATE_PATH=1` makes it drop the `pool`
+            // binary onto PATH (via the user's shell rc) instead of the default
+            // `ask` mode, which no-ops when there's no TTY — otherwise `pool`
+            // installs to ~/.local/bin but stays undetectable. We still write the
+            // agent's config ourselves via `configure_poolside`.
+            //
+            // On the Unix side the env vars MUST sit on the `sh` that actually
+            // runs the piped script, NOT on the leading `curl`: in
+            // `VAR=1 curl ... | sh` the assignment applies only to curl's
+            // environment and the downstream `sh` never sees it, so the installer
+            // fell back to the interactive EULA prompt and failed with
+            // "/dev/tty: Device not configured" (ATO-… Poolside promo). Windows
+            // is unaffected because `$env:` sets the var for the whole session
+            // before `iex` runs, and PowerShell's installer defaults UpdatePath
+            // to true.
+            let (program, args): (String, Vec<String>) = if cfg!(windows) {
+                (
+                    "powershell".to_string(),
+                    vec![
+                        "-NoProfile".to_string(),
+                        "-Command".to_string(),
+                        "$env:POOL_INSTALL_ACCEPT_EULA='1'; irm https://downloads.poolside.ai/pool/install.ps1 | iex".to_string(),
+                    ],
+                )
+            } else {
+                (
+                    "sh".to_string(),
+                    vec![
+                        "-c".to_string(),
+                        "curl -fsSL https://downloads.poolside.ai/pool/install.sh | POOL_INSTALL_ACCEPT_EULA=1 POOL_INSTALL_UPDATE_PATH=1 sh".to_string(),
+                    ],
+                )
+            };
+            let prereq = if cfg!(windows) { "powershell" } else { "curl" };
+            Ok((program, args, prereq, "https://docs.poolside.ai/cli"))
+        }
         "zed" => {
             // Zed ships its own installer (NOT npm). On macOS/Linux the official
             // shell script downloads the editor and drops a `zed` CLI shim on
@@ -1760,16 +1906,33 @@ fn refresh_windows_path() -> Option<String> {
 
     let user = read_scope("User");
     let machine = read_scope("Machine");
-    if user.is_none() && machine.is_none() {
+
+    // The npm global prefix on Windows defaults to %APPDATA%\npm, where global
+    // shims (claude.cmd, codex.cmd, opencode.cmd, ...) installed via `npm i -g`
+    // live. A fresh Node/npm install adds this to the *user* PATH, but a running
+    // GUI may have snapshotted PATH before that entry was broadcast (and `install_agent`
+    // installs into exactly this dir). Include it explicitly so npm-based agents
+    // resolve from any spawned process even when the registry PATH lacks it.
+    let npm_global = std::env::var("APPDATA")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|appdata| format!("{}\\npm", appdata.trim_end_matches('\\')));
+
+    if user.is_none() && machine.is_none() && npm_global.is_none() {
         return None;
     }
 
     let live = std::env::var("PATH").unwrap_or_default();
     let mut merged: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for chunk in [machine.as_deref(), user.as_deref(), Some(live.as_str())]
-        .into_iter()
-        .flatten()
+    for chunk in [
+        machine.as_deref(),
+        user.as_deref(),
+        npm_global.as_deref(),
+        Some(live.as_str()),
+    ]
+    .into_iter()
+    .flatten()
     {
         for part in chunk.split(';').map(str::trim).filter(|p| !p.is_empty()) {
             let key = part.to_lowercase();
@@ -1846,7 +2009,7 @@ fn decode_console_bytes(bytes: &[u8]) -> String {
 /// Proxy details forwarded from the app's in-app proxy config so that spawned
 /// agent installers/terminals can reach the network when the user is behind a
 /// region block. Mirrors the frontend `useProxyConfig` store fields we need.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 pub struct ProxyEnv {
     pub url: String,
     pub username: Option<String>,
@@ -2044,6 +2207,111 @@ pub async fn detect_agent_installed(
     }
 }
 
+/// Attempt to install Node.js (which bundles npm) for the user via the Windows
+/// Package Manager (`winget`), so npm-based Launch-page agents install on a
+/// fresh machine without the user leaving the app. Streams winget output to the
+/// same `agent_install_log:<id>` event the agent installer uses.
+///
+/// Returns `true` only when, after the attempt, `npm` resolves on the
+/// freshly-refreshed PATH. Gracefully returns `false` (the caller then surfaces
+/// the actionable "install Node.js from nodejs.org" error) when winget is
+/// absent (e.g. Windows LTSC / older builds), the install fails, or npm still
+/// isn't found. Windows-only; a no-op returning `false` on other platforms.
+#[cfg(windows)]
+async fn try_bootstrap_npm_via_winget<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    event: &str,
+    proxy: Option<ProxyEnv>,
+) -> bool {
+    // winget itself (App Installer) must be present; it ships on Win10 1809+
+    // mainline but not on LTSC / Server / stripped images.
+    if !detect_agent_installed("winget".to_string(), None)
+        .await
+        .installed
+    {
+        let _ = app_handle.emit(
+            event,
+            "npm not found and winget is unavailable - cannot auto-install Node.js.".to_string(),
+        );
+        return false;
+    }
+
+    let _ = app_handle.emit(
+        event,
+        "npm not found. Installing Node.js LTS via winget...".to_string(),
+    );
+
+    let app = app_handle.clone();
+    let ev = event.to_string();
+    let ran = tokio::task::spawn_blocking(move || -> bool {
+        use std::io::{BufRead, BufReader};
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut cmd = Command::new("winget");
+        cmd.args([
+            "install",
+            "--id",
+            "OpenJS.NodeJS.LTS",
+            "-e",
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        apply_runtime_path(&mut cmd);
+        if let Some(ref proxy) = proxy {
+            apply_proxy_env(&mut cmd, proxy);
+        }
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = app.emit(&ev, format!("Failed to spawn winget: {}", e));
+                return false;
+            }
+        };
+        if let Some(stdout) = child.stdout.take() {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = app.emit(&ev, line);
+            }
+        }
+        if let Some(stderr) = child.stderr.take() {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = app.emit(&ev, line);
+            }
+        }
+        matches!(child.wait(), Ok(s) if s.success())
+    })
+    .await
+    .unwrap_or(false);
+
+    if !ran {
+        let _ = app_handle.emit(
+            event,
+            "Node.js installation via winget did not complete successfully.".to_string(),
+        );
+        return false;
+    }
+
+    // winget adds the Node install dir to PATH; `detect_agent_installed`
+    // re-reads the registry PATH at runtime, so npm is found without a restart.
+    detect_agent_installed("npm".to_string(), None)
+        .await
+        .installed
+}
+
+#[cfg(not(windows))]
+async fn try_bootstrap_npm_via_winget<R: Runtime>(
+    _app_handle: &AppHandle<R>,
+    _event: &str,
+    _proxy: Option<ProxyEnv>,
+) -> bool {
+    false
+}
+
 /// Install an external agent by spawning its official installer, streaming
 /// stdout/stderr to the UI via the `agent_install_log:<agent_id>` event.
 #[tauri::command]
@@ -2054,6 +2322,8 @@ pub async fn install_agent<R: Runtime>(
 ) -> Result<(), String> {
     let (program, args, prereq, docs) = agent_install_spec(&agent_id)?;
 
+    let event = format!("agent_install_log:{}", agent_id);
+
     // `detect_on_native_path` re-reads the registry PATH at runtime on Windows
     // so a Node/npm installed after the app launched (or present in the registry
     // but not the GUI's snapshotted PATH) is found without an app restart.
@@ -2061,15 +2331,22 @@ pub async fn install_agent<R: Runtime>(
         .await
         .installed
     {
-        return Err(format!(
-            "'{}' is required to install this agent but was not found on PATH. \
-             Install it (Node.js from https://nodejs.org for npm-based agents), \
-             then restart Atomic Chat and try again: {}",
-            prereq, docs
-        ));
+        // For npm-based agents on Windows, try to auto-install Node.js (which
+        // bundles npm) via winget before giving up, so the Launch flow works on
+        // a fresh machine. Falls back to the actionable error when winget is
+        // unavailable or the install fails.
+        let bootstrapped = prereq == "npm"
+            && try_bootstrap_npm_via_winget(&app_handle, &event, proxy.clone()).await;
+        if !bootstrapped {
+            return Err(format!(
+                "'{}' is required to install this agent but was not found on PATH. \
+                 Install it (Node.js from https://nodejs.org for npm-based agents), \
+                 then restart Atomic Chat and try again: {}",
+                prereq, docs
+            ));
+        }
     }
 
-    let event = format!("agent_install_log:{}", agent_id);
     let agent_id_log = agent_id.clone();
 
     let (success, captured) =
@@ -2293,6 +2570,110 @@ pub fn configure_opencode(
     log::info!("OpenCode configured: baseURL={}, model={}", api_url, model);
     Ok(())
 }
+
+const OPENCLAUDE_ATOMIC_PROFILE_ID: &str = "provider_atomic_chat";
+
+fn openclaude_global_config_path(home: &str) -> PathBuf {
+    PathBuf::from(home).join(".openclaude.json")
+}
+
+/// Configure OpenClaude by upserting an `atomic-chat` provider profile in the
+/// global config (`~/.openclaude.json`) and syncing the startup profile file
+/// (`~/.openclaude/.openclaude-profile.json`). OpenClaude explicitly does not
+/// read `~/.claude` / `~/.claude.json` (see its README's "OpenClaude config
+/// cutover" section), so there is no legacy path to fall back to. OpenClaude
+/// routes atomic-chat through its OpenAI-compatible shim; local Atomic Chat
+/// needs no API key.
+#[tauri::command]
+pub fn configure_openclaude(
+    api_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let _ = api_key;
+
+    let home = agent_home_dir()?;
+    let config_path = openclaude_global_config_path(&home);
+    let config_home = PathBuf::from(&home).join(".openclaude");
+    std::fs::create_dir_all(&config_home)
+        .map_err(|e| format!("Failed to create {}: {}", config_home.display(), e))?;
+
+    let mut root: serde_json::Value = if config_path.exists() {
+        let text = std::fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+        if text.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&text).map_err(|e| {
+                format!(
+                    "Could not parse {}: {}. Fix or remove the file and try again.",
+                    config_path.display(),
+                    e
+                )
+            })?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not a JSON object", config_path.display()))?;
+
+    let profile_entry = serde_json::json!({
+        "id": OPENCLAUDE_ATOMIC_PROFILE_ID,
+        "name": "Atomic Chat",
+        "provider": "atomic-chat",
+        "baseUrl": api_url,
+        "model": model,
+    });
+
+    let profiles = obj
+        .entry("providerProfiles")
+        .or_insert_with(|| serde_json::json!([]));
+    if !profiles.is_array() {
+        *profiles = serde_json::json!([]);
+    }
+    let arr = profiles.as_array_mut().unwrap();
+    if let Some(index) = arr.iter().position(|entry| {
+        entry.get("id").and_then(|v| v.as_str()) == Some(OPENCLAUDE_ATOMIC_PROFILE_ID)
+            || entry.get("provider").and_then(|v| v.as_str()) == Some("atomic-chat")
+    }) {
+        arr[index] = profile_entry;
+    } else {
+        arr.push(profile_entry);
+    }
+
+    obj.insert(
+        "activeProviderProfileId".to_string(),
+        serde_json::json!(OPENCLAUDE_ATOMIC_PROFILE_ID),
+    );
+
+    let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&config_path, pretty + "\n")
+        .map_err(|e| format!("Failed to write {}: {}", config_path.display(), e))?;
+
+    let profile_path = config_home.join(".openclaude-profile.json");
+    let profile_file = serde_json::json!({
+        "profile": "atomic-chat",
+        "env": {
+            "OPENAI_BASE_URL": api_url,
+            "OPENAI_MODEL": model,
+        },
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+    });
+    let profile_pretty = serde_json::to_string_pretty(&profile_file).map_err(|e| e.to_string())?;
+    std::fs::write(&profile_path, profile_pretty + "\n")
+        .map_err(|e| format!("Failed to write {}: {}", profile_path.display(), e))?;
+
+    log::info!(
+        "OpenClaude configured: baseURL={}, model={}, config={}",
+        api_url,
+        model,
+        config_path.display()
+    );
+    Ok(())
+}
+
 
 /// Configure MiMo Code by upserting `provider.atomic` in
 /// `~/.config/mimocode/mimocode.json` (strict JSON, other providers preserved).
@@ -3277,6 +3658,76 @@ pub fn configure_kilo(
     Ok(())
 }
 
+/// Poolside standalone mode expects a base URL WITHOUT the `/v1` suffix.
+fn poolside_standalone_base_url(api_url: &str) -> String {
+    let trimmed = api_url.trim().trim_end_matches('/');
+    trimmed
+        .strip_suffix("/v1")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Configure Poolside CLI via its standalone OpenAI-compatible environment
+/// variables. Poolside has no provider config file for BYOK — it reads
+/// `POOLSIDE_STANDALONE_*` from the environment at launch — so we persist them
+/// to the user's shell rc (Windows: `setx`). The auto-opened terminal also
+/// passes them inline so the session works without re-sourcing the rc file.
+#[tauri::command]
+pub fn configure_poolside(
+    api_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    let key_val = api_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .unwrap_or("atomic");
+    let standalone_base = poolside_standalone_base_url(&api_url);
+
+    let mut env_vars: Vec<(String, String)> = Vec::with_capacity(3);
+    env_vars.push((
+        "POOLSIDE_STANDALONE_BASE_URL".to_string(),
+        standalone_base.clone(),
+    ));
+    env_vars.push(("POOLSIDE_API_KEY".to_string(), key_val.to_string()));
+    env_vars.push(("POOLSIDE_STANDALONE_MODEL".to_string(), model.clone()));
+
+    const MARKER: &str = "# Atomic Chat - Poolside Config";
+
+    if cfg!(target_os = "windows") {
+        for (key, value) in &env_vars {
+            let output = std::process::Command::new("setx")
+                .arg(key)
+                .arg(value)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Failed to set env var {}: {}", key, stderr));
+            }
+        }
+        log::info!(
+            "Poolside configured (Windows env): base_url={}, model={}",
+            standalone_base,
+            model
+        );
+        return Ok(());
+    }
+
+    let home = agent_home_dir()?;
+    let is_macos = cfg!(target_os = "macos");
+    let (_shell, env_file_path) = detect_shell_env_file(&home, is_macos);
+    write_marked_env_to_shell(&env_file_path, MARKER, "POOLSIDE_", &env_vars)?;
+    log::info!(
+        "Poolside configured: base_url={}, model={}, rc={}",
+        standalone_base,
+        model,
+        env_file_path
+    );
+    Ok(())
+}
+
 /// Configure Cline CLI by RUNNING its official non-interactive setup command
 /// (`cline auth ...`) rather than writing a config file. Cline has no clean
 /// user-facing config file and no base-URL env var; its on-disk state
@@ -3411,6 +3862,11 @@ pub fn open_agent_terminal(
         // applied below reaches the interactive agent.
         let mut cmd = std::process::Command::new("cmd");
         cmd.args(["/C", "start", "", "cmd", "/K", &command]);
+        // The launched console inherits this `cmd`'s environment, so refresh the
+        // PATH from the registry (+ npm global prefix) here — otherwise a console
+        // started from a GUI launched before Node/npm was installed inherits a
+        // stale snapshot and can't find npm-installed agent shims (claude.cmd, ...).
+        apply_runtime_path(&mut cmd);
         if let Some(ref proxy) = proxy {
             apply_proxy_env(&mut cmd, proxy);
         }
@@ -3435,7 +3891,10 @@ pub fn open_agent_terminal(
             let mut cmd = std::process::Command::new(term);
             cmd.args(*pre);
             cmd.args(["bash", "-lc", &inner]);
-            // The emulator inherits this env; `bash -lc` then sees the proxy.
+            // The emulator inherits this env; resolve the login-shell PATH so the
+            // agent binary is found, then `bash -lc` sees PATH + proxy.
+            apply_login_path(&mut cmd);
+            apply_runtime_path(&mut cmd);
             if let Some(ref proxy) = proxy {
                 apply_proxy_env(&mut cmd, proxy);
             }
@@ -3574,5 +4033,42 @@ pub fn migrate_macos_autostart_launchagent<R: Runtime>(
     {
         let _ = &app;
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the SIGABRT after MCP tool-call replies: delivering
+    /// a desktop notification must be safe from a tokio runtime worker thread.
+    /// The plugin's own `notify` command called blocking `show()` (zbus
+    /// `Runtime::block_on` on Linux) directly on a worker and aborted with
+    /// "Cannot start a runtime from within a runtime".
+    #[test]
+    fn show_desktop_notification_is_safe_on_runtime_worker() {
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_notification::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("failed to build mock app");
+        let handle = app.handle().clone();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to build runtime");
+
+        rt.block_on(async move {
+            // Run on a worker thread (not the test thread driving block_on) to
+            // mirror how Tauri executes async commands.
+            tokio::spawn(async move {
+                // Delivery may fail (no notification daemon in CI); the test
+                // only asserts the call does not panic inside the runtime.
+                let _ = show_desktop_notification(handle, "test".into(), "test".into()).await;
+            })
+            .await
+            .expect("notification task panicked");
+        });
     }
 }

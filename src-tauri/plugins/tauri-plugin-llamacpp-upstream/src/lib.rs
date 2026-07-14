@@ -29,6 +29,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::load_llama_model,
             commands::unload_llama_model,
             commands::get_devices,
+            commands::check_spec_type_support,
             commands::generate_api_key,
             commands::is_process_running,
             commands::get_random_port,
@@ -56,7 +57,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             backend::validate_backend_string,
             backend::should_migrate_backend,
             backend::handle_setting_update,
-            backend::install_bundled_backend
+            backend::install_bundled_backend,
+            backend::fetch_manifest_http1
         ])
         .setup(|app, _api| {
             // Initialize and manage the plugin state
